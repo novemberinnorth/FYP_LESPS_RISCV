@@ -1,0 +1,1 @@
+已知使用CM32M433R-START开发板，软件使用Nuclei Studio，现在想要运行系统的示例程序，该示例程序的基本功能为串口初始化设置并打印“USART Printf Example: retarget the C library printf function to the USART”，教程链接位于https://www.rvmcu.com/quickstart-show-id-15.html，现在按照教程步骤执行，编译无问题，但串口（COM3）无任何输出。
