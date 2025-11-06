@@ -1,0 +1,125 @@
+PS D:\My_Workspace> & C:/Python312/python.exe "d:/My_Workspace/FYP_LESPS_RISCV/Serial File Transport.py"
+✅ Port COM3 is available
+📁 Sending file: testfile.txt (20 bytes)
+📄 File content: 12345678901234567890
+🔢 File content (hex): 3132333435363738393031323334353637383930
+✅ Serial port COM3 opened successfully
+🔄 Performing simple handshake with MCU...
+📥 MCU: "READY\r\n\r\n===============================================\r\nFile Stream AES CBC Processor\r\n===============================================\r\nOptions:\r\n1. Interactive AES CBC (press 'i')\r\n2. File-based AES CBC (press 'f')\r\n3. File transfer test (press 't')\r\nChoose mode: 🔧 System state: 1\r\n"
+✅ MCU is ready!
+📤 Selecting file mode...
+✅ MCU entered file mode successfully
+📤 Sending header: SIZE:20
+📤 Sending file data...
+📤 Progress: 16/20 bytes (80.0%)
+📤 Progress: 20/20 bytes (100.0%)
+✅ File sent completely, sending end marker: b'END\n'
+🔄 Waiting for MCU processing...
+📥 MCU: ✅ Detected END marker (without newline), stopping reception
+📥 MCU: ✅ File reception completed: 31 bytes
+📥 MCU: 📨 Data preview (first 64 bytes): SIZE:20\n12345678901234567890END
+📥 MCU: 🔢 Hex preview (first 32 bytes): 53 49 5a 45 3a 32 30 0a 31 32 33 34 35 36 37 38 39 30 31 32 33 34 35 36
+📥 MCU: 37 38 39 30 45 4e 44 
+📥 MCU: 🔧 System state: 4
+📥 MCU: 🔍 Parsing received data (31 bytes)...
+📥 MCU: 📋 Full data analysis:
+📥 MCU:   [  0] 0x53 'S'
+📥 MCU:   [  1] 0x49 'I'
+📥 MCU:   [  2] 0x5a 'Z'
+📥 MCU:   [  3] 0x45 'E'
+📥 MCU:   [  4] 0x3a ':'
+📥 MCU:   [  5] 0x32 '2'
+📥 MCU:   [  6] 0x30 '0'
+📥 MCU:   [  7] 0x0a '\n'
+📥 MCU:   [  8] 0x31 '1'
+📥 MCU:   [  9] 0x32 '2'
+📥 MCU:   [ 10] 0x33 '3'
+📥 MCU:   [ 11] 0x34 '4'
+📥 MCU:   [ 12] 0x35 '5'
+📥 MCU:   [ 13] 0x36 '6'
+📥 MCU:   [ 14] 0x37 '7'
+📥 MCU:   [ 15] 0x38 '8'
+📥 MCU:   [ 16] 0x39 '9'
+📥 MCU:   [ 17] 0x30 '0'
+📥 MCU:   [ 18] 0x31 '1'
+📥 MCU:   [ 19] 0x32 '2'
+📥 MCU:   [ 20] 0x33 '3'
+📥 MCU:   [ 21] 0x34 '4'
+📥 MCU:   [ 22] 0x35 '5'
+📥 MCU:   [ 23] 0x36 '6'
+📥 MCU:   [ 24] 0x37 '7'
+📥 MCU:   [ 25] 0x38 '8'
+📥 MCU:   [ 26] 0x39 '9'
+📥 MCU:   [ 27] 0x30 '0'
+📥 MCU:   [ 28] 0x45 'E'
+📥 MCU:   [ 29] 0x4e 'N'
+📥 MCU:   [ 30] 0x44 'D'
+📥 MCU: 📋 Detected protocol header
+📥 MCU: 📋 Declared file size: 20 bytes
+📥 MCU: 📋 Content starts at position: 8
+📥 MCU: 📋 Found END marker at position: 28
+📥 MCU: 📋 Content ends at position: 28
+📥 MCU: 📋 Actual content length: 20 bytes
+📥 MCU: ✅ Successfully extracted 20 bytes (matches declared size)
+📥 MCU: --- EXTRACTED FILE CONTENT ---
+📥 MCU: 📦 File size: 20 bytes
+📥 MCU: 📝 Content (hex): 3132333435363738393031323334353637383930
+📥 MCU: 📝 Content (text): "12345678901234567890"
+📥 MCU: ------------------------------
+📥 MCU: 🔧 STARTING AES CBC PROCESSING
+📥 MCU: ------------------------------
+📥 MCU: --- BLOCK 1 ---
+📥 MCU: 📦 Block size: 16 bytes
+📥 MCU: 📊 Remaining: 20 bytes
+📥 MCU: 📥 Input data (hex): 31323334353637383930313233343536
+📥 MCU: 📦 Padded data (hex): 31323334353637383930313233343536
+📥 MCU: 🔄 Current IV (hex): 0102030405060708090a0b0c0d0e0f10
+📥 MCU: 🔒 Encrypting block...
+📥 MCU: 🔐 Encrypted (hex): 72443c947273f17c16e48f38205a756d
+📥 MCU: 📤 Sending encrypted data (Base64 encoded)...
+📥 MCU: B64:
+📥 MCU: ckQ8lHJz8XwW5I84IFp1bQ==Sent 24 bytes
+📥 MCU: 🔓 Decrypting for verification...
+📥 MCU: 📤 Decrypted (hex): 31323334353637383930313233343536
+📥 MCU: 📊 Progress: 16/20 bytes (80%)
+📥 MCU: --- BLOCK 2 ---
+📥 MCU: 📦 Block size: 4 bytes
+📥 MCU: 📊 Remaining: 4 bytes
+📥 MCU: 📥 Input data (hex): 37383930
+📥 MCU: PKCS#7 Padding:
+📥 MCU:         original length = 4,
+📥 MCU:         padding value = 0x0c,
+📥 MCU:         new length = 16
+📥 MCU: 🎯 Final block - Padding applied
+📥 MCU: 📦 Padded data (hex): 373839300c0c0c0c0c0c0c0c0c0c0c0c
+📥 MCU: 🔄 Current IV (hex): 72443c947273f17c16e48f38205a756d
+📥 MCU: 🔒 Encrypting block...
+📥 MCU: 🔐 Encrypted (hex): 8945ba9ea7cea79e48629fac4564556a
+📥 MCU: 📤 Sending encrypted data (Base64 encoded)...
+📥 MCU: B64:
+📥 MCU: iUW6nqfOp55IYp+sRWRVag==Sent 24 bytes
+📥 MCU: 🔓 Decrypting for verification...
+📥 MCU: 📤 Decrypted (hex): 373839300c0c0c0c0c0c0c0c0c0c0c0c
+📥 MCU: PKCS#7 Unpadding:
+📥 MCU:         unpadding value = 0x0c,
+📥 MCU:         original length = 4
+📥 MCU: ✅ Successfully unpadded to 4 bytes
+📥 MCU: 📝 Unpadded data (hex): 37383930
+📥 MCU: 📊 Progress: 20/20 bytes (100%)
+📥 MCU: ==============================================
+📥 MCU: 📋 PROCESSING SUMMARY
+📥 MCU: ==============================================
+📥 MCU: ✅ File processing completed!
+📥 MCU: 📦 Total blocks processed: 2
+📥 MCU: 📊 Total bytes processed: 20
+📥 MCU: --- FINAL DECRYPTED DATA ---
+📥 MCU: 📝 Decrypted data (hex): 3132333435363738393031323334353637383930
+📥 MCU: 📝 Decrypted data (text): "12345678901234567890"
+📥 MCU: --- INTEGRITY VERIFICATION ---
+📥 MCU: ✅ Length matches: 20 bytes
+📥 MCU: 🎉 SUCCESS: Decrypted data matches original!
+📥 MCU: ==============================================
+📥 MCU: 🔧 System state: 0
+📥 MCU: 🔧 System state: 0
+📥 MCU: 🔁 System reset to idle state
+📥 MCU: 🔄 Ready for new session

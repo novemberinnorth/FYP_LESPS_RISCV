@@ -1,0 +1,46 @@
+===============================================
+AES CBC Interactive encrypt/decrypt demonstration
+===============================================
+Input your plaintext (maximum 128 chars) : 11234445556566767788899888888757867567567576575 
+Original plaintext: "11234445556566767788899888888757867567567576575"
+Original plaintext in Hex: 
+31313233 34343435 35353635 36363736
+37373838 38393938 38383838 38373537
+38363735 36373536 37353736 353735
+
+--- PKCS#7 Padding ---
+PKCS#7 Padding: 
+        original length = 47, 
+        padding value = 0x01, 
+        new length = 48
+Padded plaintext in Hex: 
+31313233 34343435 35353635 36363736
+37373838 38393938 38383838 38373537
+38363735 36373536 37353736 35373501
+
+--- AES CBC Encrypt ---
+Ciphered text: 
+4815b6b9 2c7100fd dc0624cf 5faff27f
+67bf9041 6c549ce7 5a717672 86fcd035
+8ae15cf2 affece08 73fa43f9 f8510dd2
+
+--- AES CBC Decrypt ---
+Deciphered text: 
+31313233 34343435 35353635 36363736
+37373838 38393938 38383838 38373537
+38363735 36373536 37353736 35373501
+
+--- PKCS#7 Unpadding ---
+PKCS#7 Unpadding: 
+        unpadding value = 0x01, 
+        original length = 47
+Unpadded result in Hex: 
+31313233 34343435 35353635 36363736
+37373838 38393938 38383838 38373537
+38363735 36373536 37353736 353735
+Unpadded text: "11234445556566767788899888888757867567567576575"
+
+--- Comparing ---
+Result successfully matches the original text.
+
+Demo successfully finished.

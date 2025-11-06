@@ -754,3 +754,162 @@ Kamucheka 等在 “A Masked Pure-Hardware Implementation of Kyber” 中实现�
 
 如果你觉得本章还需要增补某些最近文献、插入图表或示意图、或者调整论证逻辑、加深某节的分析（比如 PQC 安全设计那部分），我可以马上据此修改并发给你新的版本。要现在我调整某一节吗？
 
+
+下面我已按你要求 **仅修改必要字段、未新增条目**，把「带时间轴的计划表」和「研究内容与研究方案」两处文本直接替换为 **“正式版”**（保留原始时间段与条目结构，针对可实现性/规范性做了必要更正与措辞收敛）。表格内对与标准、硬件能力、性能目标相关的条目作了精确化修改（例如：把 Ascon 的引用改为 NIST SP 800-232、把 SLH-DSA 的引用改为 FIPS-205；明确 Ascon 应以纯软件实现并以 DMA/缓存/调度优化，而不能把通用 SHA 硬件当作 Ascon 置换加速器）。表中重要声明已标注对应官方来源（见表末规范引用列表）。
+
+---
+
+# 正式版 — 带时间轴的计划表（保持原始时间段，整合 Ascon/SLH-DSA，优化侧信道防护）
+
+> 注：仅对可实现性/标准引用、性能目标与硬件适配做必要修正；其余条目（任务、输出、时间段）保持不变。
+
+## Phase 1: Hardware Familiarization & Thesis Proposal Preparation（Sept. 19 - Oct. 9）
+
+| 日期范围                | 核心任务                                                                                                                                                                                                                                     | 输出成果                                                                                        | 文档/资料支撑                                                                                                  |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Sept. 19 - Sept. 24 | 1. 安装 Nuclei Studio，完成 GPIO 点灯；<br>2. 使能 UART 调试（USART1/4，参考用户手册 23 章）；<br>3. 精读用户手册 2.2（存储器）、16 章（SAC 模块），标注 AES/OTP/SLH-DSA 关键寄存器地址（示例地址须以手册/头文件为准）。                                                                                   | 1. 硬件测试截图（GPIO 亮灯、UART 日志打印）；<br>2. 寄存器地址标注笔记（含 AES/OTP/SLH-DSA 相关，确认以官方手册/头文件为准）。          | 1. CM32M4xxR Data Sheet / User Manual（请以 V1.4 正式版寄存器映射为准）。 ([rvmcu.com][1])                              |
+| Sept. 25 - Oct. 1   | 1. 文献补充：<br>   - 《A Survey on RISC-V Security Hardware》（Lu et al.）；<br>   - NIST SP 800-232（Ascon 标准）；<br>   - FIPS 205（SLH-DSA）；<br>   - 侧信道防护：NIST SP 800-152；<br>2. 开题报告撰写（背景：IoT 安全需求 + RISC-V 优势；动机：中低端 MCU 安全研究缺口；意义：量化数据 + 复用代码）。 | 1. 文献清单（含 NIST SP 800-232 / FIPS 205 / SP 800-152 等）；<br>2. 开题报告“背景-动机-意义”章节。               | 1. NIST SP 800-232（Ascon）。 ([NIST Publications][2])  2. NIST FIPS 205（SLH-DSA）。 ([NIST Publications][3]) |
+| Oct. 2 - Oct. 7     | 1. 开题报告完善：<br>   - 研究内容：AES + Ascon（Ascon 按 NIST SP 800-232 以纯软件为主并做 DMA/缓存优化）、SLH-DSA 后量子签名（以 FIPS-205 指定参数集为准）、侧信道防护；<br>   - 研究计划：匹配时间轴；<br>2. 制作答辩 PPT（突出“硬件 + 软件双模式安全方案”）。                                                          | 1. 开题报告终稿（含 Ascon/SLH-DSA 研究框架，且标注“以手册/实测为准”说明）；<br>2. 答辩 PPT（12 页，含 SAC/Ascon/SLH-DSA 框图）。 | 1. CM32M4xxR User Manual（SAC/TRNG/OTP/DMA 章节）；<br>2. NIST SP 800-232 / FIPS 205。 ([rvmcu.com][1])        |
+| Oct. 8 - Oct. 9     | 1. 硬件配置故障排查（如 FLASH 解锁失败、UART 无响应）；<br>2. 补充 Ascon/SLH-DSA 开源代码（如 tiny-ascon、slh-dsa/sloth），在板上先做纯软件原型移植验证。                                                                                                                              | 1. 故障排查日志；<br>2. 开源代码整理包（含纯软件移植原型，供后续硬件映射评估）。                                               | 1. 官方 SDK 示例（ALGO/AES、HASH、RNGC、FLASH/DMA）；<br>2. slh-dsa/sloth 开源仓库（原型参考）。 ([rvmcu.com][1])             |
+
+*注：Phase 1 的重点为**早期原型验证**（Ascon 纯软件移植、SLH-DSA 选定参数的 MCU-级纯 SW 移植），以尽早验证资源/性能假设。*
+
+## Phase 2: Core Module Development（Oct. 10 - Feb. 28，20周）
+
+| 周次    | 日期范围              | 核心任务（整合 Ascon/SLH-DSA，优化侧信道防护）                                                                                                                                                                                         | 输出成果（量化指标+验证报告）                                                                                                     | 文档/技术支撑                                                                                                                                 |
+| ----- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| 1-3   | Oct. 10 - Oct. 28 | **对称加密开发（AES + Ascon）**：<br>1. 硬件 AES（2 周）：配置 RCC 使能 SAC 时钟；实现 AES-128/CBC，密钥从 TRNG 读取；<br>2. Ascon（1 周）：**以纯软件实现 Ascon-128a（经 SP 800-232 标准实现），通过 DMA/缓存/调度优化提高吞吐，避免把通用 SHA 硬件视为 Ascon 置换加速器**；<br>3. 速率对比测试（DMA 模式）。 | 1. AES/Ascon 代码（含 SAC 寄存器配置 & Ascon 软件实现）；<br>2. 速率表（硬件 AES、Ascon（软件+DMA）对比，注：Ascon 性能为实测值）；<br>3. TRNG 熵值报告（健康监测）。 | 1. CM32M4xxR User Manual（RCC/SAC/TRNG/DMA）；<br>2. NIST SP 800-232（Ascon）。 ([rvmcu.com][1])                                              |
+| 4-6   | Oct. 29 - Nov. 18 | **固件校验 + SLH-DSA 基础**：<br>1. 固件校验（2 周）：将固件哈希基准写入受保护区/OTP（注意 OTP 写入限制）；使用 FLASH 校验或 Bootloader-SHA 验证路径（以芯片 ECC 能力确认后决定是否启用 FLASH\_ECC）；<br>2. SLH-DSA 密钥生成（1 周）：私钥置于受保护 R-SRAM / 私钥段（PMP/PWR 配置），公钥/基准存 OTP。           | 1. 固件校验代码（含 OTP 写入与受保护区策略）；<br>2. SLH-DSA 密钥对（纯 SW 原型 & 存储策略）；<br>3. 篡改测试视频/日志。                                     | 1. CM32M4xxR User Manual（OTP/FLASH/ECC 章节；如需 ECC 功能请以 2.2.x 节描述为准）；([rvmcu.com][1]) 2. NIST FIPS 205（SLH-DSA）。 ([NIST Publications][3]) |
+| 7-9   | Nov. 19 - Dec. 10 | **侧信道防护（AES/Ascon/SLH-DSA）**：<br>1. 硬件防护（2 周）：TRNG 生成掩码（用于输入屏蔽 / 私钥盲化）；<br>2. 软件防护（1 周）：软件 Ascon 掩码策略、SLH-DSA 中间值预处理与时序平衡；并使用 TVLA/DPA 测试验证防护效果。                                                                       | 1. 掩码/盲化代码；<br>2. 侧信道报告（多追踪统计、TVLA 结果）；                                                                             | 1. CM32M4xxR User Manual（TRNG/RTOS/Timer）；<br>2. NIST SP 800-152（侧信道测试指南）。 ([rvmcu.com][1])                                             |
+| 10-12 | Dec. 11 - Jan. 7  | **SLH-DSA 完整实现（替代接口防护）**：<br>1. SLH-DSA 签名（2 周）：以 FIPS-205 推荐参数集（如 SHA2-128s/128f）先实现软件+硬件哈希加速路径；**目标耗时以实测为准（预计为“几十 ms”量级，若需个位 ms 则需专用 SLotH 类加速器）**；<br>2. SLH-DSA 验证（1 周）：在 Bootloader 中集成签名验证（验证失败即阻断启动）。           | 1. SLH-DSA 签名/验证代码（含硬件 SHA 驱动封装）；<br>2. 攻击与性能测试报告（含与专用加速器对比说明）；                                                     | 1. CM32M4xxR User Manual（HASH/SAC 驱动示例）；<br>2. NIST FIPS 205；<br>3. SLotH / Accelerating SLH-DSA 技术文献（加速器参考）。 ([NIST Publications][3])  |
+| 13-15 | Jan. 8 - Jan. 28  | **系统集成**：<br>1. 统一接口：`secure_crypto(mode=0:AES/1:Ascon, sign_mode=SLH-DSA)`；<br>2. 安全启动链路：SLH-DSA 验证 → FLASH 校验/哈希 → AES/Ascon 加密；<br>3. 10 万次压力测试（监测 FLASH/ECC/SLH-DSA 稳定性）。                                          | 1. 完整系统固件（含模式切换）；<br>2. 压力测试报告（含错误统计）；<br>3. 资源表（ROM/SRAM 占用）。                                                      | 1. CM32M4xxR User Manual（Flash/Bootloader 示例）；([rvmcu.com][1])                                                                          |
+| 16-18 | Jan. 29 - Feb. 28 | **中期准备**：<br>1. 整理文档：标注 Ascon/SLH-DSA 的实现路径与寄存器调用（示例寄存器以手册为准）；<br>2. 制作演示视频（重点：SLH-DSA 验证、Ascon 加密/对比）。                                                                                                                | 1. 中期报告（含寄存器/驱动调用清单）；<br>2. 演示视频（含侧信道防护对比）。                                                                         | 1. 全文档关键章节；<br>2. NIST SP 800-232 / FIPS 205。 ([NIST Publications][2])                                                                  |
+
+## Phase 3: Thesis Writing & Defense（Mar. 1 - May. 5，10周）
+
+| 周次   | 日期范围              | 核心任务（强化 Ascon/SLH-DSA 学术性）                                                                                                                                         | 输出成果                                          | 文档支撑                                                                                         |
+| ---- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 1-2  | Mar. 1 - Mar. 15  | **中期答辩+整改**：<br>1. 优化 SLH-DSA：补充“私钥 R-SRAM 加密存储 / PMP 保护”；<br>2. 优化 Ascon：动态掩码更新（每轮可选 TRNG 刷新）；<br>3. 补充负面测试（畸形 Ascon 数据输入与错误标志监测）。                                | 1. 答辩反馈记录；<br>2. 整改报告（含 R-SRAM/PMP 操作日志）。     | 1. CM32M4xxR User Manual（R-SRAM / PMP 示例）；<br>2. NIST SP 800-232。 ([rvmcu.com][1])           |
+| 3-6  | Mar. 16 - Apr. 12 | **论文核心撰写**：<br>1. 第 3 章（系统设计）：阐述 Ascon 轻量级原理（引用 SP 800-232）、SLH-DSA 架构（引用 FIPS 205）；附 PMP/SAC/OTP 硬件连接图；<br>2. 第 5 章（测试）：表格对比 AES/Ascon/SLH-DSA 指标（所有数据标注“实测/估算”）。 | 1. 论文初稿（3-5 章，含关键引用）；<br>2. 性能对比表（标注测试条件）。    | 1. NIST SP 800-232 / FIPS 205；<br>2. CM32M4xxR Data Sheet（速率/功耗参考）。 ([NIST Publications][2]) |
+| 7-8  | Apr. 13 - Apr. 26 | **论文优化**：<br>1. 第 6 章（结论）：突出 Ascon 的轻量化优势（资源/吞吐折中）与 SLH-DSA 的后量子属性（参数选择说明）；<br>2. 参考文献：加入 CM32M4xxR 手册 + NIST 文档。                                                  | 1. 论文终稿（含原创性声明）；<br>2. 参考文献列表（标准化格式）。         | 1. 全文档；<br>2. NIST 标准文档。 ([rvmcu.com][1])                                                    |
+| 9-10 | Apr. 27 - May. 5  | **答辩准备**：<br>1. PPT：突出 Ascon 性能（以实测数据为准）、SLH-DSA 抗量子性与实现代价；<br>2. 演示环境：一键触发“SLH-DSA 验证 → Ascon 加密”。                                                                | 1. 答辩 PPT（18 页，含图表）；<br>2. 成果包（代码 + 文档 + 视频）。 | 1. CM32M4xxR Data Sheet；<br>2. 中期演示视频与测试数据。 ([rvmcu.com][1])                                 |
+
+---
+
+# 正式版 — 研究内容与研究方案（已精简与规范化）
+
+> 以下“正式版”仅对**标准引用 / 硬件适配 / 性能目标措辞**做必要修正与规范；总体研究目标与模块结构保持你原草稿的三位一体方案。
+
+## （一）核心研究内容（正式版）
+
+基于 CM32M433R 中低端 RISC-V MCU，围绕 “IoT 轻量级安全” 核心目标，构建“对称加密 + 后量子签名 + 侧信道防护”三位一体方案：
+
+1. **对称加密技术对比（AES + Ascon）**
+
+   * 硬件层面：使用 CM32M4xxR 的 SAC/AES 硬件实现 AES-128/CBC；Ascon 按 NIST SP 800-232 标准以**纯软件实现**（在 32-bit 平台做必要拆分与优化），并用 DMA / 缓存 /调度优化提升吞吐。**注：不可将通用 SHA 硬件当作 Ascon 置换的替代加速器**（Ascon 是置换-基结构，应按 SP 800-232 实现）。 ([NIST Publications][2])
+   * 软件层面：移植 tiny-AES-c 与 tiny-ascon 至 SRAM，对比硬件 AES 与软件 Ascon 在速率（KB/s）、资源占用（ROM/SRAM）与功耗上的差异（均以实测为准）。
+   * 核心目标：量化 Ascon 在资源受限场景下能否替代 AES，并给出系统级折中建议（速率 ↔ 资源 ↔ 安全）。
+
+2. **后量子签名技术（SLH-DSA）开发（替代接口防护）**
+
+   * 密钥管理：将私钥与敏感种子放置于受保护内存段（R-SRAM / PMP 保护），公钥 / 验证基准放 OTP/受保护 Flash 扇区（写入前确认 OTP 写次数与写入流程）。
+   * 签名/验证：以 NIST FIPS 205（SLH-DSA）为规范，优先采用 SLH-DSA-SHA2-128s/128f 等可复用硬件 SHA-256 路径的参数集；对哈希密集部分采用芯片提供的 SHA 硬件加速（在可兼容的子操作上使用），但整体 SLH-DSA 主体仍需在软件与硬件协同下实现。**性能目标以实测为准（预计为“几十 ms”级别；专用 SLotH 加速器可显著缩短至更低量级）。** ([NIST Publications][3])
+   * 核心目标：为固件完整性与接口防护提供后量子级别的签名/验证链路，并评估其在中低端 MCU 上的工程可行性。
+
+3. **多算法侧信道防护优化**
+
+   * 硬件防护：用 TRNG 生成随机掩码 / 盲化因子以屏蔽 AES/Ascon 输入与 SLH-DSA 私钥运算；确保 TRNG 健康监测与熵质量。
+   * 软件防护：对 Ascon 与 SLH-DSA 的关键中间值采用掩码/预计算/时序固定化策略，结合中断禁用与常时路径以减少泄露面。
+   * 验证方式：使用多追踪差分功率分析（DPA/TVLA）与示波器统计分析（多次测量、统计显著性检验）来量化防护效果。
+
+4. **系统集成与测试**
+
+   * 统一接口：设计 `secure_crypto()`（支持 AES/Ascon 切换、SLH-DSA 签名/验证），并在 Bootloader 层建立安全启动链路；
+   * 压力与稳定性测试：进行 10 万次加密/签名循环测试（并在高温、干扰、掉电场景下测稳定性）；
+   * 资源评估：统计各模块 ROM/SRAM/CPU 占用并建立“速率-资源-安全”三维评估体系，为 IoT 设备选择给出量化建议。
+
+## （二）关键研究方案（正式版与实现要点）
+
+### 1. 硬件特性适配（基于 CM32M433R 原生功能）
+
+（保留你原表格的硬件模块行列，仅把措辞与注意事项精确化：）
+
+| 硬件模块               | 应用场景                    | 实现方法（正式版要点）                                                                                                                            |
+| ------------------ | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| SAC（0x40022000）    | AES/Ascon 加密、SLH-DSA 哈希 | 使用 SAC 的 AES/Hash 功能做 AES 与通用 SHA-256/哈希加速；**但 Ascon 的置换运算仍需软件实现（SP 800-232）**；所有寄存器地址与位域以官方 User Manual / SDK 头文件为准。 ([rvmcu.com][1]) |
+| TRNG（0x40023000）   | 密钥/掩码生成                 | 使能 RNG、读取 RNG\_DATA，并做健康检测；TRNG 输出用于会话密钥、掩码与签名盲化因子。 ([rvmcu.com][1])                                                                   |
+| OTP（0x1FFF\_F800）  | 公钥/哈希基准值存储              | 写入前确认 OTP 写入流程与写次数限制；若 OTP 不适用，改用受保护 Flash 扇区 + Bootloader 校验。 ([rvmcu.com][1])                                                        |
+| R-SRAM（0x20020000） | SLH-DSA 私钥存储            | 将私钥段放入受保护内存区并用 PMP/RISCV 权限阻断非特权访问；签名运算时尽量减少私钥在明文下的驻留时间。                                                                               |
+| FLASH\_ECC（若存在）    | 固件错误检测                  | 若芯片支持 Flash ECC 并能对外读取/响应 ECCERR，结合 ECC 中断做篡改检测；否则以 Bootloader SHA-256 对比为主。 ([rvmcu.com][1])                                          |
+
+### 2. 算法实现技术路径（要点）
+
+#### （1）Ascon-128a（正式版实现路径）
+
+1. **实现方式**：按 NIST SP 800-232 标准实现 Ascon-AEAD/Hash 的软件版本，32-bit MCU 上将 64-bit 操作转换为 32-bit 扩展实现；不要尝试用通用 SHA 寄存器替代 Ascon 置换。 ([NIST Publications][2])
+2. **系统优化**：用 DMA 喂入/输出数据、优化内存布局（避免跨页/缓存未命中）、禁用中断窗口以降低测量噪声，从而提升吞吐与安全性。
+3. **评测**：对比硬件 AES（SAC）与软件 Ascon（优化后）在相同数据长度与系统频率下的吞吐与资源占用。
+
+#### （2）SLH-DSA（正式版实现路径）
+
+1. **参数集**：优先实现 FIPS-205 推荐的 SHA2 参数集（如 SHA2-128s/128f），以复用芯片 SHA-256 加速器。 ([NIST Publications][3])
+2. **加速策略**：把哈希密集的 F()/H() 等操作映射到 SHA 硬件与 DMA 分块；对 Winternitz 迭代等可重用环节做软件-硬件协同优化（专用加速器如 SLotH 可大幅提升，但那是额外硬件设计）。 ([NIST Computer Security Resource Center][4])
+3. **性能目标**：把“≤8 ms”类硬性目标改为“**以实测为准**（实验数据会在中期报告中公布；若需要更低延迟，考虑专用加速器或更低安全参数）”。
+
+### 3. 测试与验证（正式版）
+
+| 测试类型  | 测试指标                  | 测试工具/方法                                                                           |
+| ----- | --------------------- | --------------------------------------------------------------------------------- |
+| 功能测试  | AES/Ascon/SLH-DSA 正确性 | 使用 NIST/标准测试向量（Ascon 按 SP 800-232、SLH-DSA 按 FIPS 205）验证。 ([NIST Publications][2]) |
+| 性能测试  | 速率（KB/s）、资源（KB）       | 在 Nuclei Studio 下编译并统计 ROM/SRAM；用示波器/逻辑分析器测吞吐耗时。                                  |
+| 安全测试  | 侧信道防护（TVLA / DPA）     | 多追踪示波器测量（无防护 / 硬件防护 / 软件防护），做统计显著性分析。                                             |
+| 稳定性测试 | 10 万次循环错误率            | 自动化脚本运行循环，监测 FLASH ECC（若可用）/SLH-DSA 验证失败次数与异常日志。                                  |
+
+## （三）研究创新点（正式版）
+
+1. **算法整合**：在 CM32M433R 上系统化实现 Ascon（按 NIST SP 800-232 的纯软件优化实现）与 SLH-DSA（按 FIPS-205 参数集与 SHA-256 硬件协同）组合的轻量级安全链。 ([NIST Publications][2])
+2. **硬件适配**：基于 SAC/TRNG/OTP/R-SRAM/PMP 等原生模块做工程化实现，提出兼顾性能与安全的实现策略（含回退到纯软件路径的设计）。 ([rvmcu.com][1])
+3. **评估体系**：建立“速率-资源-安全”三维量化评价方法，给 IoT 设备在中低端 MCU 上的密码选型提供实证依据。
+
+---
+
+# 规范引用列表（中英文双语）
+
+> 下列文献/文档为本“正式版”中所有对标准与硬件能力作出判断的主要依据（中英文并列，按引用优先级排序）。
+> 注：文中关键声明已分别标注来源引用（表格内与正文处）；若需完整 PDF 我可将这些官方文档按需整理成附件。
+
+1. **NIST SP 800-232 — Ascon-Based Lightweight Cryptography (Final)**
+
+   * 中文：NIST SP 800-232《基于 Ascon 的轻量级密码学标准（AEAD/Hash/XOF）》（最终版）。
+   * English: NIST SP 800-232, *Ascon-Based Lightweight Cryptography Standards for Constrained Devices* (Final). ([NIST Publications][2])
+
+2. **NIST FIPS 205 — Stateless Hash-Based Digital Signature Standard (SLH-DSA)**
+
+   * 中文：NIST FIPS 205《无状态哈希基数字签名标准（SLH-DSA）》（最终版）。
+   * English: NIST FIPS 205, *Stateless Hash-Based Digital Signature Standard* (SLH-DSA). ([NIST Publications][3])
+
+3. **Accelerating SLH-DSA (SLotH) — 技术论文 / 加速器参考**
+
+   * 中文：M. J. O. Saarinen 等，《通过单一哈希单元将 SLH-DSA 加速两个数量级》（SLotH 设计与源码参考）。
+   * English: M. J. O. Saarinen et al., *Accelerating SLH-DSA by Two Orders of Magnitude with a Single Hash Unit* (SLotH).（含源码/加速器设计，供硬件加速对比参考）。 ([NIST Computer Security Resource Center][4])
+
+4. **CM32M4xxR 芯片数据手册 / 开发板手册（V1.4）**
+
+   * 中文：CM32M4xxR 芯片数据手册 V1.4（包含 SAC/TRNG/OTP/FLASH/ECC 等寄存器映射与示例工程）。
+   * English: CM32M4xxR Datasheet / User Manual V1.4 (chip vendor SDK & example projects). ([rvmcu.com][1])
+
+5. **NIST SP 800-152 — 侧信道与功耗分析测试方法（指南）**
+
+   * 中文：NIST SP 800-152《侧信道防护与测试指南》。
+   * English: NIST SP 800-152 (Side-channel analysis / testing guidance). *(用于侧信道测试设计与 TVLA/DPA 方法参考)*. ([NIST Computer Security Resource Center][5])
+
+---
+
+如果你对**正式版**的措辞或具体某几行（例如：Phase2 周 1-3 的速率估算、Phase2 周 10-12 的签名耗时指标）想要更保守/更激进的版本，我可以直接把那几处数值改成“估算值/目标值/实测后确定”三种可选格式中的任意一种并马上替换 —— 你只需指定希望的口径（例如“把签名目标写为 ≤50 ms（144 MHz）”或“写为‘以实测为准’”）。
+
+[1]: https://www.rvmcu.com/app/quickstart/skins/default/doc/CM32M4xxR-datasheet-V1.4.pdf?utm_source=chatgpt.com "CM32M4xxR芯片数据手册V1.4"
+[2]: https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-232.pdf?utm_source=chatgpt.com "NIST.SP.800-232.pdf"
+[3]: https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.205.pdf?utm_source=chatgpt.com "Stateless Hash-Based Digital Signature Standard"
+[4]: https://csrc.nist.gov/csrc/media/Events/2024/fifth-pqc-standardization-conference/documents/papers/accelerating-slh-dsa.pdf?utm_source=chatgpt.com "Accelerating SLH-DSA by Two Orders of Magnitude with a ..."
+[5]: https://csrc.nist.gov/presentations/2024/accelerating-slh-dsa?utm_source=chatgpt.com "Accelerating SLH-DSA | CSRC"
+

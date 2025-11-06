@@ -1,0 +1,172 @@
+好 — 我按**不同实验条件（设备充足 / 设备一般 / 设备受限 / 无实测硬件，仅仿真）**给出可操作的TVLA验证方案，同时就你关心的三类算法（AES、ASCON、SLH-DSA）分别说明可行性判断要点与注意事项。文中把**可直接执行的步骤**、**需要的设备/参数范围**、**期望样本量/统计阈值**和**进阶（高阶）TVLA 的实操建议**都列清楚，便于你在任何场景下立刻开始实验或判断是否需要改进实验条件。文末我也给出一份简短的“实验检查表 + 推荐脚本/数据格式”清单（可直接用来写采集或分析代码）。
+
+> 说明：下面关于 SLH-DSA、ASCON 与 TVLA 的背景和实践参考来自公开资料（我在准备时引用了 NIST / TVLA 相关资料与 ASCON / SLH-DSA 的侧信道研究）。例如 SLH-DSA（stateless hash-based）及其侧信道讨论见 FIPS/RFC/研究报告；TVLA 的 ±4.5 判据和双数据集做法是广泛实践中的推荐流程与 Goodwill 等人的说明。([NIST Publications][1])
+
+# 一、各场景总览（先看结论，再看细节步骤）
+
+## 场景 A — 理想/标准实验室（推荐做法）
+
+设备典型条件（满足任一）：
+
+* 差分探头或单端探头配合差分测量方案 + 示波器采样率 ≥ 100 MS/s（越高越好，500 MS/s 更佳），垂直分辨率 ≥ 8 bit（若可选 10–12 bit 更好）；
+* 低阻分流（例如 0.01–1 Ω，根据电流大小选）或精密电流探头；稳定触发源；可批量自动发送明文/密钥并记录触发时间。
+
+可行性：**完全可行**。可以按经典 TVLA 流程做一阶验证；若一阶通过但仍担忧，可做高阶 TVLA 或进攻型测试（CPA / ML）。
+
+主要参数建议（可直接用）：
+
+* 采集：固定明文组（Fixed） vs 随机明文组（Random），**每组首次采集 1,000–5,000 条 trace**；对每个 test 做**两个独立数据集**（独立采集）以避免假阳性（Goodwill 建议的做法）。([NIST Computer Security Resource Center][2])
+* 统计检验：使用 Welch’s two-sample t-test（逐时间点），常见判据：若在同一时间点两个独立数据集中均出现 |t| > 4.5（±4.5σ），则判为有可利用泄露；若你选择更保守的显著性（例如 α=0.01），则阈值不同，但 ±4.5 是行业常用推荐。([Rambus][3])
+* 预处理：去直流 (DC)、基线扣除、对齐（trigger 或通过相关/互相关对齐）、必要时带通滤波以去除工频噪声。
+* 判定流程：先做 General Test（fixed vs random）；若通过，再做针对性中间变量（例如 AES 的 S-box 输入/输出 / Ascon 的 nonce/状态位 / SLH-DSA 的私钥衍生步骤）做“特定中间量”测试。
+
+高阶（2阶及以上）建议：
+
+* 若目标是检测掩蔽/高阶防护是否有效，需用到**二阶 TVLA（或中心化乘积等方法）**，这需要更多样本（**通常 10k 到 100k+ traces**，具体取决于掩蔽阶数与实施质量），并需要更高采样精度与严格的对齐。简单结论：**一阶 TVLA 能发现绝大多数非掩蔽实现的泄露；要测试掩蔽有效性必须做二阶或更高阶测试，并准备显著更多的样本量与更好的 SNR**。 (参见后文步骤) 。
+
+## 场景 B — 中等设备（单端探头，示波器采样 50–200 MS/s）
+
+典型条件：没有差分探头，只能用示波器通道直接跨小分流测量或测量单端地线起伏。
+
+可行性：**可行但需谨慎**。SNR 下降，需要更多 traces 与更严格的对齐与滤波。
+
+操作要点：
+
+* 使用更小的分流 (降低幅度但减小寄生)，并放大输入通道；避免地环路（把地线短且稳固）；多次独立重复采集以确认结果。
+* 样本量：Fixed/Random 每组建议 **2,000–10,000 traces**（依 SNR 增加）。两个独立数据集仍然必需。
+* 如果信噪比太低（t-test 不稳定），优先考虑改进探测方式（差分探头 / EM 探针）或提高采样（可外接高采样卡）而不是盲目增加 traces。
+
+## 场景 C — 受限设备（只有万用表 / 低端示波器 / 无外部触发）
+
+典型条件：只有 DM858 型万用表、低端示波器（采样率很低或无触发），DHO814 等基本型号。
+
+可行性：**一阶 TVLA 很可能不可行或非常低效**。原因：万用表无法提供高时间分辨率；低端示波器无稳定触发/低采样会把信息平均掉。
+
+替代方案（推荐顺序）：
+
+1. **使用简单 EM 探针（手工线圈）和普通示波器**：在芯片附近扫探寻找 EM 热点，若有明显时间相关响应，尝试记录（EM 有时比电源测量更容易拿到局部信息）。
+2. **仿真/软件侧测试**：在没有合适硬件前，先用模拟器/FPGA 仿真并导出电流模型或 log，可做初步 TVLA。
+3. **租借/借用实验室资源** 或 升级探测器（差分探头或高采样采集卡）。
+
+总结：若只能使用万用表或低端示波器，**不要期望能对掩蔽/高阶防护做有效TVLA**；可以先做系统级的功能/时间序列记录，但不能替代高分辨率侧通道测量。
+
+## 场景 D — 无硬件，仅仿真（软件仿真或模拟器）
+
+可行性：**可行作为先导工作**。你可以用功能仿真产生功耗模型（Hamming weight/transition 等），对实现代码用模拟噪声叠加后做 TVLA，来判断实现上的“潜在”泄露点并改进代码。真实硬件往往有额外物理泄露，因此仿真能捕捉逻辑性的问题但不能完全替代实测。
+
+# 二、针对三种算法的可行性/实施细节与特别注意
+
+（下述每项都假设你会对报告中写的“具体防护实现”进行一一对应检查；若报告里某些实现步骤模糊，我在最后给出如何在报告里快速判定实现是否匹配实验要求的检查点）
+
+## 1) AES（对称块密码）
+
+* 常见泄露点：S-box 输入/输出、轮中间量、查表/时间分支等。
+* TVLA 策略：做 General Fixed vs Random（能发现整体与密钥相关的泄露）；做 Specific Intermediates（比如针对 S-box 输出对应的字节取固定 vs 其他分组）。
+* 可行性判断要点（检查你报告的实现细节）：
+
+  * 是否使用查表（T-tables）或硬件 S-box？查表更易泄露且需要特定时间点的定位。
+  * 是否采用掩蔽（masking）？若有掩蔽，则一阶 TVLA 可能无法检测到，但二阶/多阶 TVLA 或攻击（CPA 的高阶版本）可能能检测或攻击。
+* 建议：先做一阶 TVLA（Fixed vs Random）用 ±4.5 两套独立数据集；若无明显泄露，可做针对性测试；若实现声称有掩蔽，则直接做二阶 TVLA 并准备大样本量。([Rambus][3])
+
+## 2) ASCON（轻量级 AEAD 算法）
+
+* 背景：已有研究指出 ASCON 的某些软件/硬件实现会产生侧信道泄露（有论文做了 Root-cause 分析）。因此务必对实现细节（bitslice/非 bitslice、S-box 实现、nonce/状态加载方式）逐条检查。([NIST Computer Security Resource Center][4])
+* TVLA 策略：与 AES 类似，但目标中间量通常是状态或 S-box 操作相关位。建议先做 General Test，再做针对 nonce/state 的 Specific Tests。
+* 可行性判断要点（检查报告）：实现是否采用 bit-sliced 或流水化，状态是寄存器级还是内存操作？这些都会影响泄露位置与 SNR。若报告中有“对 ASCON 做了某种变换或压缩”，需确认能否触发/暴露中间态以便做 Specific TVLA。([NIST Computer Security Resource Center][5])
+
+## 3) SLH-DSA（stateless hash-based signature，类似 SPHINCS / FIPS 205）
+
+* 说明：SLH-DSA 属于近年标准化/讨论的 stateless hash-based 签名（FIPS 205 / RFC / PQC 社区讨论）。其签名/密钥生成过程涉及大量哈希和树结构，侧信道敏感点与传统对称算法不同（例如私钥 seed 的派生、WOTS/FORS 操作）。已有工作指出某些 CPU 实现非常容易泄露 private seed，需要大量 traces 才能评估，且存在对抗侧信道的特别设计建议。([NIST Publications][1])
+* TVLA 策略：
+
+  * 对于 SLH-DSA，**TVLA 仍然可以检测到是否存在数据相关泄露**，但通常需要把测试设计成针对私钥材料生成/签名过程中的特定中间量（例如 SK.seed 的派生、FORS 节点处理）。
+  * 因为签名流程复杂，建议先用仿真/软件模型定位潜在泄露时间窗，然后对硬件/CPU实现做高样本量的一阶与二阶 TVLA（文献中曾用到 100k trace 量级进行评估）。如果报告里使用了“特殊加速单元（如 SLotH）”或声明“side-channel resistant”，需要针对这些单元做专门的 TVLA/攻击评估。([IACR Artifact Archive][6])
+* 可行性判断要点（检查报告）：你需要在报告中找到**签名的关键中间步骤**（哪些步骤用到了 SK.seed / WOTS 私钥派生 / tree-walk），并确认是否能控制输入（message）与记录触发点（签名开始/结束），否则 TVLA 难以对齐和分析。
+
+# 三、可复制的 TVLA（一阶）实验步骤（从接线到统计）
+
+下面按“理想实验室”给出可直接复制的步骤；在设备受限时按上文调整样本量与采样质量即可。
+
+1. **确定测试目标 & 测试点（中间量）**
+
+   * General: 固定明文/消息（或固定 key） vs 随机明文/消息。
+   * Specific: 选定中间量（例如 AES S-box 输出的某字节，或 SLH-DSA 中某次哈希的输入位）。
+
+2. **硬件连接**
+
+   * 电源测量：在 Vcc 或 GND 线上并入低阻分流或用差分/电流探头，接到示波器。
+   * EM：如果电源信号弱，尝试在芯片或引脚上用小线圈/EM 探针扫定位。
+   * 确保触发：用 GPIO 或串口/排针输出作为加密/签名开始触发信号，示波器以此同步采样。
+
+3. **采集参数**
+
+   * 采样率：至少数十倍于时钟频率；如果是芯片级测量，建议 ≥ 4 samples/clock（理想 ≥ 10 samples/clock）。采样越高，时间分辨越细。
+   * 每条 trace 的时间窗：覆盖从加密开始到关键中间量计算结束，并留有前后边界。
+   * 每组 trace 数量：Fixed vs Random 每组初步 1k–5k；视 SNR 上调。对每个 test 做两套独立数据集（分别采集）。([Rambus][3])
+
+4. **预处理**
+
+   * 基线校正（remove DC）、削峰（windowing）、（必要时）无参数带通滤波。
+   * 对齐：若触发点稳定也可直接对齐；若触发不稳定，用互相关或模板匹配算法做时间对齐。
+   * 去趋势/归一化（按需要）。
+
+5. **统计检验（一阶 TVLA）**
+
+   * 对每个采样点计算 Welch’s t-statistic（Fixed vs Random），得到时间序列的 t 值。
+   * 判据：若在**两个独立数据集中**有同一时间点 |t| > 4.5，则判定为泄露（industry practice）。若你希望改阈值，可按显著性水平和多重比较调整（Bonferroni 等）。([Rambus][3])
+
+6. **诊断与定位**
+
+   * 若发现泄露：检查时间点对应的实现步骤（根据触发和时序图）；再针对该中间量做 Specific TVLA（例如固定该值的不同取值对比），或进行 CPA/Template 攻击验证能否恢复密钥。
+   * 若没有发现：不能说明“绝对安全”；说明在当前 SNR 与样本量下没有检测到一阶数据相关性；如果实现为掩蔽/高阶防护，继续做二阶测试或进攻式评估。
+
+# 四、二阶/高阶 TVLA 与何时必须做
+
+* **何时做高阶**：实现中明确使用掩蔽（masking）或声称“侧信道安全到某阶”，或一阶 TVLA 未发现但你仍怀疑会被多变量/高阶方法打破时。
+* **方法**：常见的是用“中心化乘积法（centered product）”或对 trace 的若干采样点做多项式组合，然后用 t-test 或其他统计量。
+* **样本量**：通常大幅增加 — **从 10k 到数十万 traces**（与掩蔽阶数和实现细节强相关）。文献报告中对 SLH-DSA/某些实现的评估曾使用 100k 量级样本。([IACR Artifact Archive][6])
+* **实践建议**：二阶测试前先行仿真以估计所需样本量 & 设计合适的中心化组合；确保采样分辨率足够并尽量提升 SNR（屏蔽、差分测量、低噪放大器）。
+
+# 五、如何在报告中快速判定“实现细节是否支持可行的 TVLA” — 检查清单
+
+在你报告里找以下要点（有则利于做 TVLA，没有或表述含糊则需要额外实验准备）：
+
+1. 是否注明了**测量触发点**（例如“签名开始时 MCU 输出 X 引脚置高”）？（必需）
+2. 是否说明了**中间量**或关键步骤（哪一步处理私钥材料、哪一步做 S-box）？（必需）
+3. 是否说明了**硬件环境**（是否有外设供电、是否在 SoC 内核、时钟频率是多少）？（影响采样与对齐）
+4. 是否声称有**掩蔽 / 常数时间 / 漏电抑制**措施？如果有，需要在实验中针对性做高阶 TVLA 或其他攻击验证。
+5. 是否给出**重复性/触发稳定性**的信息（例如是否能连续重复同一操作 10k 次并自动化）？（直接影响可采集样本量）
+
+如果报告中某一点缺失，我会按上面的场景给出补救措施（例如添加 GPIO 触发、使用 EM 探测或先做仿真）。
+
+# 六、实用小技巧（能显著提升成功率）
+
+* 始终做两个独立数据集以降低假阳性率。([NIST Computer Security Resource Center][2])
+* 给示波器尽可能短的接地回路（地线短）并用屏蔽罩减少环境噪声。
+* 在采集中加入少量已知“模板”trace（用作对齐/参考），并用互相关做二次对齐。
+* 做初步的频谱分析（FFT）找出噪声峰（如 50/60 Hz）并用窄带滤波去除。
+* 若 SNR 很低，先做简单平均看能否定位时间窗，再做大样本统计。
+
+# 七、如果你现在要我直接给出的东西（我可以立刻交付，不需要额外等待）
+
+* （A）**实验检查表（可打印）**：包括接线、触发、示波器设置、采集脚本参数、文件命名约定。
+* （B）**Python 分析脚本（含采集后流程）**：载入采集的 .csv/.npy traces，做预处理（去DC、对齐）、计算 Welch’s t-stat, 输出 t-图并标出阈值 ±4.5；并能自动比对两个独立数据集判定“Pass/Fail”。（如果你愿意，我现在就可以生成该脚本）
+* （C）**针对报告中 AES / ASCON / SLH-DSA 的快速核查模板**：你把报告段落贴过来，我帮你一条条核对是否满足上面“检查清单”。（如果不想贴全文，粘几段关键实现描述也可以）
+
+如果你想，我**现在**可以直接给你：
+
+1. 一份可打印的“TVLA 实验检查表 + 示波器/采集参数模板”；或
+2. 一个完整的 Python（numpy + scipy + matplotlib）分析脚本模板（读取 traces，做预处理，画出 t-stat 时间曲线，并自动判断两个独立数据集），并说明如何把示波器数据导出成脚本可读格式（CSV/npy）。
+
+告诉我你先想要哪一个（检查表 或 分析脚本 或 把报告中有关“侧信道防护实现”的相关段落贴上来让我做核查），我会**立刻**生成并发送（不会要求你再等）。
+
+---
+
+需要我**马上**把“分析脚本模板”或“实验检查表”生成出来吗？我可以直接把 Python 分析脚本发给你（含用例说明与如何运行），或者把检查表做成 Markdown/可打印表格。你选择即可。
+
+[1]: https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.205.pdf?utm_source=chatgpt.com "Stateless Hash-Based Digital Signature Standard"
+[2]: https://csrc.nist.gov/csrc/media/events/non-invasive-attack-testing-workshop/documents/08_goodwill.pdf?utm_source=chatgpt.com "A testing methodology for side-channel resistance validation"
+[3]: https://www.rambus.com/wp-content/uploads/2015/08/TVLA-DTR-with-AES.pdf?utm_source=chatgpt.com "Test Vector Leakage Assessment (TVLA) Derived ..."
+[4]: https://csrc.nist.gov/csrc/media/Events/2023/lightweight-cryptography-workshop-2023/documents/accepted-papers/13-root-cause-analysis-of-side-channel-leakage.pdf?utm_source=chatgpt.com "Root-cause Analysis of the Side Channel Leakage from ..."
+[5]: https://csrc.nist.gov/csrc/media/Presentations/2023/root-cause-analysis-of-side-channel-leakage/images-media/june-21-liu-root-cause-analysis-ascon.pdf?utm_source=chatgpt.com "Root-cause Analysis of the Side Channel Leakage from ..."
+[6]: https://artifacts.iacr.org/crypto/2024/a7/?utm_source=chatgpt.com "Accelerating SLH-DSA by Two Orders of Magnitude with a ..."

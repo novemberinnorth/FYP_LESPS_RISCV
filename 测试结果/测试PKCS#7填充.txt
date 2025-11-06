@@ -1,0 +1,37 @@
+AES CBC encrypt:
+key = 0102030405060708090a0b0c0d0e0f10
+plain = 112233445566778899aabbccddeeff00
+iv = 0102030405060708090a0b0c0d0e0f10
+cipher = 2bab0b2c5bd9f7a428af053ef23cbe61
+AES CBC decrypt:
+plainOut = 112233445566778899aabbccddeeff00
+
+=== Testing PKCS#7 Padding - 11 bytes ===
+Plain text: 112233445566778899aabb (length = 11)
+
+PKCS#7 Padding: original length = 11, 
+padding value = 0x05, 
+new length = 16
+Padded text: 112233445566778899aabb0505050505 (length = 16)
+Cipher: eb919564d6f15c348ea0a66111c51d60
+Decipher: 112233445566778899aabb0505050505
+
+PKCS#7 Unpadding: unpadding value = 0x05, 
+original length = 11
+PlainOut: 112233445566778899aabb (length = 11)
+PKCS#7 padding test passed!
+
+=== Testing PKCS#7 Padding - 7 bytes ===
+Plain text: 01020304050607 (length = 7)
+
+PKCS#7 Padding: original length = 7, 
+padding value = 0x09, 
+new length = 16
+Padded text: 01020304050607090909090909090909 (length = 16)
+Cipher: 6f8067e1b734d21f1941bbfa73a27156
+Decipher: 01020304050607090909090909090909
+
+PKCS#7 Unpadding: unpadding value = 0x09, 
+original length = 7
+PlainOut: 01020304050607 (length = 7)
+PKCS#7 padding test passed!

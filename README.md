@@ -1,2 +1,3 @@
-# FYP_LESPS_RISCV
-My personal final year project. Topic: Lightweight Embedded Security Protection System under RISC-V Architecture.
+# word_template
+
+> 在教务模板基础上修改的 Word 模板，修复若干格式问题。

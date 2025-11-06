@@ -1,0 +1,711 @@
+下面给出三部分内容：
+
+1. 可行性分析与改进建议（含对现有两份代码的“出处标注”）；
+2. 新的端到端工作流程（加/解密自动化与1KB分块）；
+3. 修改后的完整代码：①Python（在原脚本基础上新增函数与入口逻辑），②MCU固件（新增“流式加/解密”模式并保留原有演示功能）。
+
+---
+
+# 一、可行性分析（是否可实现）
+
+**结论**：完全可实现。
+原因：
+
+* **串口链路已具备握手与模式选择**：Python 一侧已包含简化握手与进入文件模式的逻辑；能检测菜单文案“Choose mode / Options”并发送`'f'`进入文件模式。MCU 一侧启动后打印菜单，等待选择并在收到`'f'`后进入“基于文件的 AES CBC 模式”。
+* **双方已具备帧头/收尾与收发 API**：Python 已发送`SIZE:len\n`与`END\n`并逐块发送文件数据；MCU 侧已有`read_file_data()`与`write_file_data()`做串口缓冲读写，以及`FILE_BUFFER_SIZE`宏（1KB）作为文件流缓冲区容量。
+* **AES-CBC + PKCS#7 已完备**：MCU 已实现 PKCS#7 填充/去填充与 AES-CBC 加解密（含演示与打印），因此扩展为“任意大小文件的分块流式处理”只需在 MCU 侧新增一个“流式模式”，对每个分块进行 CBC 串联并在最后一块执行 padding/unpadding 即可。
+* **传输中的二进制安全性**：MCU 已提供“Base64 回送加密块”的工具函数`send_encrypted_data_base64()`，可避免日志/控制台干扰二进制流。因此：加密返回使用 Base64 文本，`ciphertext.txt`天然为“文本文件”；解密时 Python 读取 Base64 文本并在发送前解码为二进制，MCU 再做解密并回传明文（二进制可直接写 output.txt；若担心控制台串扰，也可让 MCU 回传明文的 Base64——本文给出两种任选其一的实现，默认回传明文为**原始二进制**，效率更高）。
+
+> 以上判断所依据的具体代码位置：
+>
+> * Python 侧：握手与菜单探测、进入`'f'`模式与`SIZE/END`协议、按块发送与进度输出。
+> * MCU 侧：`FILE_BUFFER_SIZE`=1024 定义、串口收发、菜单/模式切换、AES-CBC与PKCS#7函数现成可复用。
+
+---
+
+# 二、可优化/改进点
+
+1. **将“文件模式”升级为“流式分块模式”（支持任意大文件）**
+
+   * 新增 MCU“流式加/解密”状态机：循环接收多帧 `SIZE:<n>\nLAST:<0|1>\n` + `<n bytes>` + `END\n`；
+   * CBC 模式在**加密**时：每块使用“前一块密文”作下一块的 IV（第一块用初始 IV）；**解密**时同理；
+   * **仅在最后一块**执行 PKCS#7（加密时补齐、解密时去除）。
+
+2. **Base64 的用法统一**
+
+   * **加密方向**：MCU 回传 Base64 文本，Python 原样写入 `ciphertext.txt`（文本文件，跨平台安全）。
+   * **解密方向**：Python 读取 `ciphertext.txt` 的 Base64 文本、在 PC 侧解码为二进制，再按 1KB 分块发给 MCU 解密，MCU 回传**原始明文二进制**（效率最高）；如果需要“全程文本”，也可以把解密回传改成 Base64 文本，再由 Python 落盘前解码——本文提供可切换开关。
+
+3. **IV 与安全性建议**
+
+   * 当前代码使用固定 IV（1..16），在功能验证阶段可用，但**生产建议**：每次加密随机 IV，并将 IV 以 16 字节前缀或单独头部存入 `ciphertext.txt`；Python 解密前读取该 IV 并传给 MCU。本文默认继续沿用现有固定 IV，避免大改现有结构。
+
+4. **协议健壮性**
+
+   * 新头字段：`LAST:0/1`（标记是否最后一块），避免 MCU 无法判断何时执行 padding/unpadding；
+   * 回包格式：每块回包前加形如 `OK <chunk_index> <out_len>\n` 的确认行，便于 Python 精准写入与进度统计。
+
+5. **彻底对齐 1KB 块大小**
+
+   * Python 端使用 `CHUNK_SIZE = 1024`，与 MCU `FILE_BUFFER_SIZE` 保持一致，满足您“每次 Python 向 MCU 传输至多 1KB（宏定义控制）”的要求。
+
+6. **端到端自动化**
+
+   * 新增 `run_encrypt_then_decrypt()`：自动执行“加密→写ciphertext.txt→解密→写output.txt→对比 input.txt 和 output.txt”，并打印“成功/失败”。
+
+---
+
+# 三、端到端流程（落地）
+
+* **输入**：`input.txt`（任意大小、任意字节内容）
+* **输出**：`ciphertext.txt`（Base64 文本）、`output.txt`（二进制，与 input.txt 一致）
+* **块大小**：1KB（Python 端宏 `CHUNK_SIZE`，MCU 端 `FILE_BUFFER_SIZE`）
+* **串口速率**：115200（沿用现有）
+* **流程**：
+
+  1. Python 打开串口→握手→进入文件模式`'f'`；
+  2. 发送命令 `OP:ENC\nTOTAL:<filesize>\nGO\n`；
+  3. 逐块发送：`SIZE:<n>\nLAST:<0|1>\n` + `<n字节>` + `END\n`；MCU 回 `OK <idx> <outlen>\n` 以及 `B64:<...>\n`（加密结果）；Python 将各块 Base64 逐行写入 `ciphertext.txt`；
+  4. 发送命令 `OP:DEC\nTOTAL:<cipher_bytes>\nGO\n`；Python 读取 `ciphertext.txt`、Base64 解码后同样 1KB 分块发送；MCU 回**原始明文二进制**；Python 逐块写入 `output.txt`；
+  5. Python 比较 `input.txt` 与 `output.txt` 字节级一致性，打印结果。
+
+---
+
+# 四、修改后的代码
+
+> 说明：
+>
+> * **Python**：在您提供的“Serial File Transport.py - 改进版本”基础上改造。保留原函数，新增一组“流式加/解密”函数与自动化主流程；默认串口端口、文件名按您的要求（`input.txt` / `ciphertext.txt` / `output.txt`，同一目录）。相关原始依据请见文内标注。
+> * **MCU**：在您提供的主程序中**新增**“流式模式”实现（不破坏原有`interactive`/`file demo`）；菜单仍按原样，选择`'f'`后进入增强文件模式并启用新的分块协议。相关原始依据请见文内标注。
+
+---
+
+## 4.1 Python（修改版）
+
+> 关键点：
+>
+> * `CHUNK_SIZE = 1024`
+> * `op_encrypt()`发送明文块，接收 Base64 行写入 `ciphertext.txt`；
+> * `op_decrypt()`读取 `ciphertext.txt` 的 Base64，解码后发送，接收明文块写入 `output.txt`；
+> * `run_encrypt_then_decrypt()`自动完成全流程与对比。
+> * 兼容现有握手/菜单/模式探测逻辑。
+
+```python
+# -*- coding: utf-8 -*-
+# File: Serial File Transport (stream AES) - merged version
+
+import serial
+import time
+import os
+import base64
+import sys
+
+# ========== 可调参数 ==========
+PORT = "COM3"
+BAUD = 115200
+CHUNK_SIZE = 1024  # 与MCU侧FILE_BUFFER_SIZE保持一致
+
+INPUT_FILE = "input.txt"
+CIPHERTEXT_FILE = "ciphertext.txt"  # Base64 文本
+OUTPUT_FILE = "output.txt"
+
+# ========== 复用您现有的握手/模式检测逻辑（保留并轻量调整） ==========
+def simple_mcu_handshake(ser, timeout=5):
+    """简化的MCU握手协议（保留原实现）"""
+    print("🔄 Performing simple handshake with MCU...")
+    start_time = time.time()
+
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    time.sleep(0.5)
+
+    # 发送任意字节触发 READY
+    ser.write(b'?')
+    time.sleep(0.2)
+
+    # 等待菜单或提示
+    buf = b""
+    while time.time() - start_time < timeout:
+        if ser.in_waiting > 0:
+            buf += ser.read(ser.in_waiting)
+            txt = buf.decode('utf-8', errors='ignore')
+            if 'READY' in txt:
+                print("✅ MCU READY")
+                break
+            if 'Choose mode' in txt or 'Options' in txt:
+                print("✅ MCU menu detected")
+                break
+        time.sleep(0.05)
+
+    return True
+
+def wait_for_menu_and_enter_file_mode(ser):
+    """等待菜单并进入增强文件模式（按'f'），兼容原版输出关键字"""
+    # 清屏读
+    time.sleep(0.2)
+    if ser.in_waiting:
+        ser.read(ser.in_waiting)
+
+    # 发送 'f'
+    print("📤 Selecting file mode ('f')...")
+    ser.write(b'f')
+    ser.flush()
+    time.sleep(0.3)
+
+    # 等待进入文件模式提示（与原文案兼容）
+    start = time.time()
+    buf = b""
+    while time.time() - start < 5:
+        if ser.in_waiting:
+            buf += ser.read(ser.in_waiting)
+            txt = buf.decode('utf-8', errors='ignore')
+            if ('File-based AES CBC' in txt or
+                'ENHANCED AES CBC' in txt or
+                'Ready to receive file data' in txt or
+                'Processor' in txt):
+                print("✅ MCU entered file mode")
+                return True
+        time.sleep(0.05)
+
+    print("⚠️ file mode detection timed out (continuing anyway)")
+    return True
+
+# ========== 新增：基于分块的流式协议工具 ==========
+def _send_line(ser, s):
+    ser.write(s.encode('utf-8'))
+    ser.flush()
+
+def _read_line(ser, timeout=5):
+    start = time.time()
+    buf = bytearray()
+    while time.time() - start < timeout:
+        if ser.in_waiting:
+            ch = ser.read(1)
+            if ch == b'\n':
+                return buf.decode('utf-8', errors='ignore').rstrip('\r')
+            else:
+                buf.extend(ch)
+        else:
+            time.sleep(0.01)
+    return None
+
+def _expect_ok_header(ser, chunk_idx, timeout=5):
+    """期望收到 'OK <idx> <outlen>' 确认行"""
+    line = _read_line(ser, timeout=timeout)
+    if not line:
+        raise RuntimeError("Timeout waiting OK header")
+    if not line.startswith("OK "):
+        raise RuntimeError(f"Unexpected header: {line!r}")
+    parts = line.split()
+    if len(parts) < 3:
+        raise RuntimeError(f"Malformed OK line: {line!r}")
+    if int(parts[1]) != chunk_idx:
+        raise RuntimeError(f"Chunk index mismatch: expect {chunk_idx}, got {parts[1]}")
+    outlen = int(parts[2])
+    return outlen
+
+# ========== 新增：操作 - 加密 ==========
+def op_encrypt(ser, in_path, out_path):
+    filesize = os.path.getsize(in_path)
+    print(f"🔐 Encrypting {in_path} -> {out_path}  (size={filesize} bytes)")
+
+    # 发送操作头
+    _send_line(ser, f"OP:ENC\n")
+    _send_line(ser, f"TOTAL:{filesize}\n")
+    _send_line(ser, f"GO\n")
+
+    sent = 0
+    chunk_idx = 0
+    with open(in_path, 'rb') as fin, open(out_path, 'w', encoding='utf-8') as fout:
+        while True:
+            chunk = fin.read(CHUNK_SIZE)
+            if not chunk:
+                # 发送结束块（SIZE:0, LAST:1）
+                _send_line(ser, "SIZE:0\n")
+                _send_line(ser, "LAST:1\n")
+                _send_line(ser, "END\n")
+                break
+
+            chunk_idx += 1
+            last = 1 if (sent + len(chunk) == filesize) else 0
+
+            _send_line(ser, f"SIZE:{len(chunk)}\n")
+            _send_line(ser, f"LAST:{last}\n")
+            ser.write(chunk)              # 原始明文数据
+            ser.flush()
+            _send_line(ser, "END\n")
+
+            # 等待 OK 与 Base64 行（MCU 回包 Base64）
+            outlen = _expect_ok_header(ser, chunk_idx, timeout=10)
+            b64line = _read_line(ser, timeout=10)
+            if not b64line or not b64line.startswith("B64:"):
+                raise RuntimeError(f"Expect B64 line, got: {b64line!r}")
+
+            # 写入 Base64 文本（不含前缀），一行一块，干净易用
+            b64data = b64line[4:]
+            fout.write(b64data + "\n")
+
+            sent += len(chunk)
+            print(f"📤 ENC progress: {sent}/{filesize} bytes ({sent*100//filesize}%)")
+
+    print("✅ Encryption done, ciphertext saved as Base64 text.")
+
+
+# ========== 新增：操作 - 解密 ==========
+RETURN_PLAINTEXT_AS_BASE64 = False  # 如需MCU以Base64回传明文，可置 True
+
+def op_decrypt(ser, in_path, out_path):
+    # 读取 Base64 文本并拼为 bytes（Python 侧先解码，再发送二进制给MCU）
+    print(f"🔓 Decrypting {in_path} -> {out_path}")
+    b64_total_lines = 0
+    cipher_bytes = bytearray()
+    with open(in_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            b64_total_lines += 1
+            cipher_bytes.extend(base64.b64decode(s))
+
+    total = len(cipher_bytes)
+    print(f"🔢 Decoded ciphertext bytes: {total}")
+
+    # 发操作头
+    _send_line(ser, f"OP:DEC\n")
+    _send_line(ser, f"TOTAL:{total}\n")
+    _send_line(ser, f"GO\n")
+    _send_line(ser, f"MODE:{'B64' if RETURN_PLAINTEXT_AS_BASE64 else 'BIN'}\n")
+
+    sent = 0
+    chunk_idx = 0
+    with open(out_path, 'wb') as fout:
+        pos = 0
+        while pos < total:
+            n = min(CHUNK_SIZE, total - pos)
+            chunk = cipher_bytes[pos:pos+n]
+            pos += n
+
+            last = 1 if pos == total else 0
+            chunk_idx += 1
+
+            _send_line(ser, f"SIZE:{len(chunk)}\n")
+            _send_line(ser, f"LAST:{last}\n")
+            ser.write(chunk)
+            ser.flush()
+            _send_line(ser, "END\n")
+
+            # 等待 OK 与数据行
+            outlen = _expect_ok_header(ser, chunk_idx, timeout=10)
+
+            if RETURN_PLAINTEXT_AS_BASE64:
+                line = _read_line(ser, timeout=10)
+                if not line or not line.startswith("B64:"):
+                    raise RuntimeError(f"Expect B64 line, got: {line!r}")
+                data = base64.b64decode(line[4:])
+            else:
+                # 直接读取二进制 outlen 字节
+                buf = bytearray()
+                start = time.time()
+                while len(buf) < outlen and time.time() - start < 10:
+                    if ser.in_waiting:
+                        buf.extend(ser.read(min(outlen - len(buf), ser.in_waiting)))
+                    else:
+                        time.sleep(0.005)
+                if len(buf) != outlen:
+                    raise RuntimeError(f"Binary read timeout: want {outlen}, got {len(buf)}")
+                data = bytes(buf)
+
+            fout.write(data)
+            sent += n
+            print(f"📥 DEC progress: {sent}/{total} bytes ({sent*100//total}%)")
+
+    print("✅ Decryption done, plaintext saved.")
+
+# ========== 新增：自动化主流程 ==========
+def run_encrypt_then_decrypt():
+    if not os.path.exists(INPUT_FILE):
+        print(f"❌ Missing {INPUT_FILE}")
+        sys.exit(1)
+
+    with serial.Serial(PORT, BAUD, timeout=1) as ser:
+        print(f"✅ Serial opened {PORT}@{BAUD}")
+        simple_mcu_handshake(ser)  #
+        wait_for_menu_and_enter_file_mode(ser)  #
+
+        # 进入增强流式模式后，执行加密与解密
+        op_encrypt(ser, INPUT_FILE, CIPHERTEXT_FILE)
+        time.sleep(0.2)
+        op_decrypt(ser, CIPHERTEXT_FILE, OUTPUT_FILE)
+
+    # 对比 input.txt 与 output.txt
+    same = False
+    with open(INPUT_FILE, 'rb') as f1, open(OUTPUT_FILE, 'rb') as f2:
+        same = (f1.read() == f2.read())
+
+    if same:
+        print("🎉 SUCCESS: input.txt == output.txt")
+    else:
+        print("❌ MISMATCH: input.txt != output.txt")
+
+if __name__ == "__main__":
+    run_encrypt_then_decrypt()
+```
+
+> 关键位置的来源说明：
+>
+> * 握手/菜单探测与`'f'`选择、检查关键提示文案，均与您原脚本的处理保持一致与兼容。
+> * 1KB 分块与宏一致性（`CHUNK_SIZE=1024`）对齐 MCU 端 `FILE_BUFFER_SIZE`。
+
+---
+
+## 4.2 MCU 固件（在原文件上新增“流式分块模式”）
+
+> 说明：
+>
+> * 保留原有 `aes_cbc_interactive()`、`process_file_aes_cbc()` 等演示；
+> * 新增 `process_stream_aes_cbc()`：实现真正的**任意大小**文件加/解密；
+> * 主菜单选项 `'f'` 时，改为调用 `process_stream_aes_cbc()`；
+> * 仍沿用固定 Key/IV（便于复用现有逻辑）；如需更安全，可扩展成随机 IV 并在头部传输/保存。
+> * 复用现有的 `pkcs7_padding()` / `pkcs7_unpadding()`、`read_file_data()` / `write_file_data()`、`DumpBytes()` 等函数。
+
+> **新增/修改片段**（将下述片段合入您提供的 MCU 源文件中相应位置即可）：
+
+```c
+// ===== 在文件顶部的 include/宏 之后，沿用您现有定义 =====
+// FILE_BUFFER_SIZE 已为 1024 
+// AES_BLOCK_SIZE 已为 16   
+// 复用 pkcs7_padding / pkcs7_unpadding / read_file_data / write_file_data 等
+
+// ===== 新增：从串口读取一行（以 '\n' 结尾），返回长度（不含结尾换行），超时返回0 =====
+static uint32_t uart_read_line(char *line, uint32_t maxlen, uint32_t wait_loops) {
+    uint32_t len = 0, loops = 0;
+    while (loops < wait_loops) {
+        if (USART_GetFlagStatus(USARTx, USART_FLAG_RXDNE) != RESET) {
+            int ch = USART_ReceiveData(USARTx);
+            if (ch == '\n' || ch == '\r') {
+                line[len] = 0;
+                return len;
+            }
+            if (len + 1 < maxlen) line[len++] = (char)ch;
+        } else {
+            // 简单等待
+            for (volatile int i = 0; i < 2000; i++);
+            loops++;
+        }
+    }
+    return 0;
+}
+
+// ===== 新增：读取一帧数据体（SIZE:n + LAST:x + <n bytes> + END）=====
+static int uart_read_frame(uint8_t *buf, uint32_t bufcap, uint32_t *size_out, int *is_last) {
+    char line[64];
+    uint32_t n = 0;
+    *size_out = 0; *is_last = 0;
+
+    // 读 SIZE 行
+    if (uart_read_line(line, sizeof(line), 30000) == 0) return -1;
+    if (strncmp(line, "SIZE:", 5) != 0) return -2;
+    n = (uint32_t)atoi(line + 5);
+    if (n > bufcap) return -3;
+
+    // 读 LAST 行
+    if (uart_read_line(line, sizeof(line), 10000) == 0) return -4;
+    if (strncmp(line, "LAST:", 5) != 0) return -5;
+    *is_last = atoi(line + 5) ? 1 : 0;
+
+    // 读数据体 n 字节
+    uint32_t rcv = 0;
+    while (rcv < n) {
+        if (USART_GetFlagStatus(USARTx, USART_FLAG_RXDNE) != RESET) {
+            buf[rcv++] = USART_ReceiveData(USARTx);
+        }
+    }
+
+    // 读 END
+    if (uart_read_line(line, sizeof(line), 10000) == 0) return -6;
+    if (strcmp(line, "END") != 0) return -7;
+
+    *size_out = n;
+    return 0;
+}
+
+// ===== 新增：Base64 编码（最小化实现，复用您现有 send_encrypted_data_base64 逻辑亦可）=====
+static const char b64_tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static void b64_encode_block(const uint8_t *in, uint32_t len, char *out) {
+    uint32_t triple = 0;
+    triple |= (len > 0 ? in[0] << 16 : 0);
+    triple |= (len > 1 ? in[1] << 8 : 0);
+    triple |= (len > 2 ? in[2] : 0);
+    out[0] = b64_tab[(triple >> 18) & 0x3F];
+    out[1] = b64_tab[(triple >> 12) & 0x3F];
+    out[2] = (len > 1) ? b64_tab[(triple >> 6) & 0x3F] : '=';
+    out[3] = (len > 2) ? b64_tab[triple & 0x3F] : '=';
+}
+
+static uint32_t b64_encode(const uint8_t *in, uint32_t inlen, char *out) {
+    uint32_t i=0, j=0;
+    while (i < inlen) {
+        uint32_t rem = inlen - i;
+        uint32_t n = rem >= 3 ? 3 : rem;
+        b64_encode_block(in + i, n, out + j);
+        i += n; j += 4;
+    }
+    out[j] = 0;
+    return j;
+}
+
+// ===== 新增：流式 AES-CBC 处理 =====
+static void process_stream_aes_cbc(void) {
+    set_system_state(STATE_FILE_MODE_READY);  //
+    printf("✅ Enhanced Stream AES-CBC Mode Ready\n");
+    fflush_output();
+
+    __attribute__ ((aligned (4))) uint8_t key[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+    __attribute__ ((aligned (4))) uint8_t iv0[16]  = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+
+    AES_PARM AES_Parm = {0};
+    uint8_t  iv_curr[16];
+    uint8_t  inbuf[FILE_BUFFER_SIZE];     // 1KB 输入缓冲
+    uint8_t  work[AES_BLOCK_SIZE];
+    uint8_t  outblock[AES_BLOCK_SIZE];
+    char     line[64];
+
+    // 读取操作头
+    if (uart_read_line(line, sizeof(line), 30000) == 0) return; // OP:ENC 或 OP:DEC
+    int do_encrypt = 0;
+    if (strcmp(line, "OP:ENC") == 0) do_encrypt = 1;
+    else if (strcmp(line, "OP:DEC") == 0) do_encrypt = 0;
+    else return;
+
+    // 总长度（仅作显示用途）
+    uint32_t total = 0;
+    if (uart_read_line(line, sizeof(line), 10000) == 0) return; // TOTAL:xxxx
+    if (strncmp(line, "TOTAL:", 6) == 0) total = (uint32_t)atoi(line + 6);
+
+    // 可选模式（解密回传BIN或B64）
+    int ret_b64 = 0; // 默认二进制回传
+    if (!do_encrypt) {
+        if (uart_read_line(line, sizeof(line), 10000) == 0) return; // 可能是 GO 或 MODE
+        if (strncmp(line, "MODE:", 5) == 0) {
+            ret_b64 = (strcmp(line + 5, "B64") == 0);
+            // 继续读 GO
+            if (uart_read_line(line, sizeof(line), 10000) == 0) return;
+        }
+    }
+
+    // should be "GO"
+    if (strcmp(line, "GO") != 0) return;
+
+    memcpy(iv_curr, iv0, 16);
+
+    uint32_t processed = 0;
+    uint32_t chunk_idx = 0;
+
+    while (1) {
+        uint32_t n = 0;
+        int is_last = 0;
+        if (uart_read_frame(inbuf, sizeof(inbuf), &n, &is_last) != 0) {
+            printf("❌ frame read error\n");
+            fflush_output();
+            break;
+        }
+        if (n == 0 && is_last) {
+            // 结束
+            break;
+        }
+
+        chunk_idx++;
+
+        // 块内以 AES_BLOCK_SIZE 处理
+        uint32_t pos = 0;
+        uint32_t out_bytes_this_chunk = 0;
+
+        // 计算 padding 情况（仅对最后一帧的最后一块做）
+        uint8_t last_block_buf[AES_BLOCK_SIZE];
+        uint32_t tail = (n % AES_BLOCK_SIZE);
+        int need_pad = (do_encrypt && is_last && (tail != 0));
+        int full_blocks = (int)(n / AES_BLOCK_SIZE);
+
+        // 发送 OK 头，先保留空间统计输出长度
+        // 对于 ENC：输出长度 = full_blocks*16 + (need_pad?16:(tail?16:0))
+        // 对于 DEC：输出长度 = full_blocks*16 (+可能包含 16*(tail!=0) )，但实际最后一帧去 padding 后才知道最终长度。
+        // 为简化：我们逐 block 发送/累积，再在同一帧内汇总长度。
+        // 这里先计算一个“估计长度”，随后严格按真实长度发送数据。
+        // 我们选择：先不立即发 OK；等算出整帧输出字节数后再发。
+
+        // ===== 先把输出缓存到一条 Base64 行或直接二进制逐 block 发送 =====
+        // 方案：为了协议一致性，每帧发送一条 B64 或一段 BIN。
+        uint8_t outbin[FILE_BUFFER_SIZE + AES_BLOCK_SIZE]; // 足够容纳多一个padding块
+        uint32_t outpos = 0;
+
+        // 处理完整 blocks
+        for (int b = 0; b < full_blocks; ++b) {
+            memcpy(work, inbuf + pos, AES_BLOCK_SIZE);
+            pos += AES_BLOCK_SIZE;
+
+            AES_Parm.in = (uint32_t*)work;
+            AES_Parm.out = (uint32_t*)outblock;
+            AES_Parm.key = (uint32_t*)key;
+            AES_Parm.iv  = (uint32_t*)iv_curr;
+            AES_Parm.inWordLen = AES_BLOCK_SIZE/4;
+            AES_Parm.keyWordLen = sizeof(key)/4;
+            AES_Parm.Mode = AES_CBC;
+            AES_Parm.En_De = do_encrypt ? AES_ENC : AES_DEC;
+
+            if (AES_Init_OK != AES_Init(&AES_Parm)) { printf("❌ AES_Init\n"); break; }
+            if (AES_Crypto_OK != AES_Crypto(&AES_Parm)) { AES_Close(); printf("❌ AES_Crypto\n"); break; }
+            AES_Close();
+
+            // CBC 串联：更新 iv
+            memcpy(iv_curr, outblock, AES_BLOCK_SIZE);
+
+            // 追加到输出缓存
+            memcpy(outbin + outpos, outblock, AES_BLOCK_SIZE);
+            outpos += AES_BLOCK_SIZE;
+        }
+
+        // 处理最后不足 16 字节的部分
+        if (tail) {
+            if (do_encrypt) {
+                // 加密：只有最后一帧才允许不足块，需 padding
+                memcpy(last_block_buf, inbuf + pos, tail);
+                if (is_last) {
+                    uint32_t padded_len = AES_BLOCK_SIZE;
+                    pkcs7_padding(last_block_buf, &padded_len, AES_BLOCK_SIZE); //
+                } else {
+                    // 中间帧不应出现非 16 对齐
+                    // 简单容错：按 16 补 0（也可直接报错）
+                    for (uint32_t i = tail; i < AES_BLOCK_SIZE; ++i) last_block_buf[i] = (uint8_t)(AES_BLOCK_SIZE - tail);
+                }
+
+                AES_Parm.in = (uint32_t*)last_block_buf;
+                AES_Parm.out = (uint32_t*)outblock;
+                AES_Parm.key = (uint32_t*)key;
+                AES_Parm.iv  = (uint32_t*)iv_curr;
+                AES_Parm.inWordLen = AES_BLOCK_SIZE/4;
+                AES_Parm.keyWordLen = sizeof(key)/4;
+                AES_Parm.Mode = AES_CBC;
+                AES_Parm.En_De = AES_ENC;
+
+                if (AES_Init_OK == AES_Init(&AES_Parm) && AES_Crypto_OK == AES_Crypto(&AES_Parm)) {
+                    AES_Close();
+                    memcpy(iv_curr, outblock, AES_BLOCK_SIZE);
+                    memcpy(outbin + outpos, outblock, AES_BLOCK_SIZE);
+                    outpos += AES_BLOCK_SIZE;
+                } else {
+                    AES_Close();
+                    printf("❌ AES tail enc\n");
+                }
+            } else {
+                // 解密：中间帧尾部应该也是 16 对齐；若不是，直接按块对齐处理（常规 CBC 密文应总是 16 的倍数）
+                // 这里假设输入密文总是 16 对齐；若不是，可缓冲到下一帧再补齐。
+                // 为简单起见，要求上位机（Python）按 1KB 分块、且密文按 16 对齐分帧（由我们在 Python 侧保证）。
+            }
+        } else if (do_encrypt && is_last && full_blocks == 0) {
+            // 特殊：最后一帧且 n==0 的情况，不需要做任何事（加密空帧）
+        }
+
+        // 解密的最后一帧：需要去 padding
+        if (!do_encrypt && is_last && outpos >= AES_BLOCK_SIZE) {
+            uint32_t ulen = outpos;
+            if (pkcs7_unpadding(outbin, &ulen) == 0) { //
+                outpos = ulen;
+            } else {
+                // unpadding 失败，保持原样（也可返回错误）
+            }
+        }
+
+        // 现在可以发 OK 头和数据体
+        printf("OK %lu %lu\n", (unsigned long)chunk_idx, (unsigned long)outpos);
+        fflush_output();
+
+        if (do_encrypt) {
+            // 回 Base64 文本（单行）
+            char *b64 = (char*)malloc(outpos * 4 / 3 + 8);
+            uint32_t b64len = b64_encode(outbin, outpos, b64);
+            printf("B64:%s\n", b64);
+            fflush_output();
+            free(b64);
+        } else {
+            if (ret_b64) {
+                char *b64 = (char*)malloc(outpos * 4 / 3 + 8);
+                uint32_t b64len = b64_encode(outbin, outpos, b64);
+                printf("B64:%s\n", b64);
+                fflush_output();
+                free(b64);
+            } else {
+                // 直接回二进制
+                write_file_data(outbin, outpos); //
+            }
+        }
+
+        processed += n;
+    }
+
+    printf("🎯 Stream AES done. processed=%lu bytes (in)\n", (unsigned long)processed);
+    fflush_output();
+}
+
+// ===== 在 main() 的 'f' 分支中，替换为调用新流式处理 =====
+/*
+case 'f':
+case 'F':
+    printf("🔧 Starting File-based AES CBC Mode...\n");
+    set_system_state(STATE_FILE_MODE_READY);
+    printf("✅ Ready to receive file data\n");
+    printf("📥 Waiting for file transmission...\n");
+    fflush_output();
+    for(volatile int i = 0; i < 500000; i++);
+    process_file_aes_cbc(); // 旧实现
+    break;
+*/
+```
+
+将上面 `case 'f'/'F'` 替换为：
+
+```c
+case 'f':
+case 'F':
+    printf("🔧 Starting Enhanced Stream File Mode...\n");
+    fflush_output();
+    process_stream_aes_cbc();   // 新的流式任意大小实现
+    break;
+```
+
+> 以上 MCU 变更均建立在您现有函数/宏/串口与 AES 工具的基础之上。
+
+---
+
+# 五、端到端自检与期望现象
+
+1. 把需要加密的原始文件命名为 `input.txt` 放在 Python 脚本同目录。
+2. 运行 Python 脚本：它会自动串口握手→进入文件模式→加密→写 `ciphertext.txt`（Base64 文本，一行一块）→再解密→写 `output.txt`。
+3. 控制台输出 `🎉 SUCCESS: input.txt == output.txt` 表示加/解密闭环正确。
+4. 若 `ciphertext.txt` 被复制到其它环境，只要把每行 Base64 拼接/解码即可还原密文字节流（建议在生产中存储“IV 前缀 + 密文”）。
+
+---
+
+# 六、与原始代码的对应关系（引用）
+
+* **Python**：
+
+  * 菜单/模式探测与 `'f'` 选择沿用原逻辑与关键字匹配；
+  * 原协议头 `SIZE:...`、`END` 的思想被扩展为**多帧循环**并新增 `LAST:` 标记。
+
+* **MCU**：
+
+  * `FILE_BUFFER_SIZE` 定义为 1024，与需求“每次至多 1KB”一致；
+  * `read_file_data()` / `write_file_data()` / `pkcs7_padding()` / `pkcs7_unpadding()` / AES-CBC 例程全部复用；
+  * 原“文件模式”打印与状态切换、菜单入口、串口配置等维持不变，仅把处理核心换成流式函数。
+
+---
+
+如果您希望把 **IV** 升级为“每次加密随机生成并写入 `ciphertext.txt` 头部”的安全实践，我可以在上述基础上再给出**最小增改补丁**（Python 写入/读取 16 字节 IV，MCU 第一帧读取 `IVHEX:...` 或二进制 16 字节），流程不变。
+
+—
+
+**引用标注**：
+
+* Python 现有握手/模式/协议与分块发送、关键提示词的检测等均来自您给出的脚本。
+* MCU 的缓冲区宏、串口 I/O、菜单/模式框架、AES-CBC 与 PKCS#7 函数均来自您给出的固件代码。

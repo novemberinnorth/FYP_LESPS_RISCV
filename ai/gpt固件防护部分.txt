@@ -1,0 +1,428 @@
+好的——我直接把你给的官方 IAP Bootloader 示例“改造成带 SLH-DSA 验证 + OTP 公钥”的最小改动方案整理出来。保持你现有的 **XMODEM 串口升级**不变，只在受控位置插入校验逻辑与少量新文件/宏。你可以按下面“**改动清单** + **新增代码**”逐步贴进工程即可编译跑通（SLH-DSA 具体算法实现用占位接口，方便你替换为实际库）。
+
+---
+
+# 一、Flash 布局与文件约定（保持现有分区，最小改动）
+
+readme 里已有分布：
+
+```
+Bootloader ： 0x08000000 - 0x08010000   (64 KB)
+Application： 0x08010000 - 0x08080000   (448 KB)
+```
+
+在 **不改现有分区** 前提下，增加一个**签名存放区域**（可以从 Application 尾部往回预留一小段，或给出固定地址）。建议做法：
+
+* **固件（app.bin）**：从 `USER_FLASH_BASE=0x08010000` 起连续写入。
+* **签名（app.sig）**：放在固定地址 `SIGN_FLASH_BASE`，例如把 Application 尾 8KB 作为签名区：
+
+  * `SIGN_FLASH_BASE = 0x0807E000`
+  * `SIGN_FLASH_SIZE = 0x00002000`（8KB，足够容纳 SLH-DSA-SHA2-128s 签名；实际以你的参数集为准）
+* **哈希范围**：对固件 **\[USER\_FLASH\_BASE, SIGN\_FLASH\_BASE) 之间的内容** 做哈希（**排除签名区**）。
+
+> 如果你更偏好“**单文件打包**（镜像尾部附带签名）”，也可用“镜像头 + sig\_offset/sig\_len”方案；但考虑你现有 XMODEM 简洁接收逻辑，我给出**双文件**方案（更少改动）：固件和签名单独以 XMODEM 分两次发送。
+
+---
+
+# 二、OTP 公钥读取与 HAL 包装
+
+* 公钥只读自 **OTP**，Bootloader 仅做读取，**不支持**在现场写入/覆盖（避免信任根被替换）。
+* 抽象两个接口（新增 `otp.c/.h`）：
+
+  * `bool otp_read_pubkey(uint8_t *buf, size_t len);`
+  * `bool otp_read_pubkey_hash(uint8_t *buf, size_t len);`（可选：若只存放公钥哈希）
+
+---
+
+# 三、最小改动点（逐文件说明）
+
+## 1) `flash.h`（新增宏）
+
+在你 readme 指定的 `IAP_Boot/Application/Include/flash.h` 增加：
+
+```c
+// 现有:
+#define BOOT_FLASH_BASE   0x08000000
+#define BOOT_FLASH_SIZE   0x00010000
+#define USER_FLASH_BASE   0x08010000
+#define USER_FLASH_SIZE   0x00070000
+
+// 新增签名区（放在 Application 尾 8KB）
+#define SIGN_FLASH_BASE   0x0807E000
+#define SIGN_FLASH_SIZE   0x00002000
+
+// 每页大小（示例已有 FLASH_PAGE_SIZE 宏）
+#define SIGN_MAX_LEN      (SIGN_FLASH_SIZE)  // 最大可接受签名长度
+
+// 计算固件可用区域（排除签名区）
+#define APP_HASH_START    (USER_FLASH_BASE)
+#define APP_HASH_END      (SIGN_FLASH_BASE)  // 不含 SIGN 区
+#define APP_HASH_SIZE     (APP_HASH_END - APP_HASH_START)
+```
+
+> 如果你的芯片页大小不是 2KB/4KB，请以头文件为准；签名区大小可按参数集实际长度留足余量。
+
+## 2) `serial.h/.c`（**无需改**）
+
+保留现有串口收发。
+
+## 3) `xmodem.c`（**极小改动**：新增一个“接收签名到固定地址”的 API）
+
+新增一个函数（不破坏原 `xmodem_receive()` 流程），用于把 **第二次**传输的 `app.sig` 放进签名区：
+
+```c
+// xmodem.h
+xmodem_status xmodem_receive_to(uint32_t dst_base, uint32_t max_len);
+
+// xmodem.c（在现有基础上复制 xmodem_receive 逻辑，只改写入起始地址与最大长度）
+xmodem_status xmodem_receive_to(uint32_t dst_base, uint32_t max_len)
+{
+  volatile xmodem_status status = X_OK;
+  uint8_t error_number = 0u;
+
+  x_first_packet_received = false;
+  xmodem_packet_number = 1u;
+  xmodem_actual_flash_address = dst_base;
+
+  while (X_OK == status)
+  {
+    uint8_t header = 0x00u;
+    ErrorStatus comm_status = serial_receive(&header, 1u, 1000);
+
+    if ((SUCCESS != comm_status) && (false == x_first_packet_received)) {
+      serial_transmitbyte(X_C);
+    } else if ((SUCCESS != comm_status) && (true == x_first_packet_received)) {
+      status = xmodem_error_handler(&error_number, X_MAX_ERRORS);
+    }
+
+    xmodem_status packet_status = X_ERROR;
+    switch(header)
+    {
+      case X_SOH:
+      case X_STX:
+        packet_status = xmodem_handle_packet_to(header, dst_base, max_len);
+        if (X_OK == packet_status)       serial_transmitbyte(X_ACK);
+        else if (X_ERROR_FLASH == packet_status) { error_number = X_MAX_ERRORS; status = xmodem_error_handler(&error_number, X_MAX_ERRORS); }
+        else status = xmodem_error_handler(&error_number, X_MAX_ERRORS);
+        break;
+      case X_EOT:
+        serial_transmitbyte(X_ACK);
+        serial_putstring((uint8_t*)"\n\rSignature received!\n\r");
+        return X_OK;
+      case X_CAN:
+        status = X_ERROR; break;
+      default:
+        if (SUCCESS == comm_status) status = xmodem_error_handler(&error_number, X_MAX_ERRORS);
+        break;
+    }
+  }
+  return status;
+}
+
+// 新增：专用于签名区的写入处理（限制不超过 max_len）
+static xmodem_status xmodem_handle_packet_to(uint8_t header, uint32_t dst_base, uint32_t max_len)
+{
+  // 基本同 xmodem_handle_packet，只是：
+  // 1) 擦写范围改为签名区
+  // 2) 写入地址从 dst_base 开始
+  // 3) 检查不越过 dst_base + max_len
+  // 4) CRC 保持（XMODEM 的链路校验）
+  ...
+}
+```
+
+> 如果你不想复制函数，也可以在现有 `xmodem_handle_packet()` 内加“目标区域选择”参数，但考虑最小入侵，我给出独立函数。
+
+## 4) `menu.c`（**两处插入**）
+
+* A) 在菜单里增加“接收签名”的选项（或保持隐藏，固定顺序：先按 1 收固件，再按 3 收签名）；
+* B) 在“执行应用”前，调用 **签名验证**。
+
+```c
+void Main_Menu(void)
+{
+  uint8_t key = 0;
+  ...
+  while (1)
+  {
+    serial_putstring((uint8_t *)"\r\n=================== Main Menu ============================\r\n\n");
+    serial_putstring((uint8_t *)"  Download image to the internal Flash ----------------- 1\r\n\n");
+    serial_putstring((uint8_t *)"  Download signature to the internal Flash ------------- 3\r\n\n"); // 新增
+    serial_putstring((uint8_t *)"  Execute the loaded application ----------------------- 2\r\n\n");
+    serial_putstring((uint8_t *)"==========================================================\r\n\n");
+
+    serial_flushdr();
+    serial_receive(&key, 1, 0xFFFFFFFF);
+
+    switch (key)
+    {
+      case '1':
+        FirmwareDownload();   // 原有：收 app.bin -> USER_FLASH_BASE 开始
+        break;
+      case '3':               // 新增：收 app.sig -> SIGN_FLASH_BASE
+      {
+        serial_putstring((uint8_t *)"Waiting for signature (.sig) ...\n\r");
+        xmodem_status r = xmodem_receive_to(SIGN_FLASH_BASE, SIGN_MAX_LEN);
+        if (r == X_OK) serial_putstring((uint8_t *)"Signature stored.\n\r");
+        else           serial_putstring((uint8_t *)"Signature receive failed.\n\r");
+        break;
+      }
+      case '2':
+        serial_putstring((uint8_t *)"Start User Application: verifying signature...\r\n\n");
+        if (verify_firmware_signature()) {   // ★ 新增：签名验证
+          JumpApp();
+        } else {
+          serial_putstring((uint8_t *)"[BLOCKED] Signature verification failed!\r\n");
+        }
+        break;
+      default:
+        serial_putstring((uint8_t *)"Invalid Number ! ==> The number should be 1/2/3\r");
+        break;
+    }
+  }
+}
+```
+
+> 你也可以在 **下载固件完成后自动提示下载签名**（流程友好），我保持菜单式最小改动。
+
+## 5) `main.c`（**加入上电即校验的路径**）
+
+当前 `main()` 按键没按下就直接 `JumpApp()`。为保证**每次上电都校验**，在 `JumpApp()` 前加一行：
+
+```c
+int main(void) {
+    Key_Init();
+
+    if (GPIO_ReadInputDataBit(GPIOA, GPIO_PIN_0) != Bit_RESET) {
+        FLASH_Init();
+        IAP_Init();
+        Main_Menu();
+    } else {
+        // ★ 在无按键情况下也进行签名校验
+        if (verify_firmware_signature()) {
+            JumpApp();
+        } else {
+            // 校验失败，回到 IAP 模式提供恢复
+            FLASH_Init();
+            IAP_Init();
+            serial_putstring((uint8_t *)"[BLOCKED] Signature invalid. Entering IAP...\r\n");
+            Main_Menu();
+        }
+    }
+    while (1) {}
+}
+```
+
+> 这样“菜单路径”和“自动启动路径”都统一成“**先校验，再启动**”。
+
+## 6) `flash.c`（**无需改**）
+
+用于擦写用户区、签名区（签名区擦写在 `xmodem_receive_to()` 内处理）。
+
+---
+
+# 四、**新增文件**：校验与 OTP 适配（占位接口，便于你替换库）
+
+## 1) `slh_verify.h/.c`（SLH-DSA 验证入口 + 哈希封装）
+
+```c
+// slh_verify.h
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#define DIGEST_LEN 32  // 以 SLH-DSA-SHA2-128s 为例：SHA-256
+
+// 读取 OTP 公钥；由 otp.c 提供
+bool otp_read_pubkey(uint8_t *buf, size_t len);
+
+// 底层哈希（推荐使用 SAC 硬件加速，见 slh_hash_*）
+bool slh_hash_init(void);
+bool slh_hash_update(const uint8_t *data, size_t len);
+bool slh_hash_final(uint8_t out32[DIGEST_LEN]);
+
+// 计算 APP 的哈希（排除签名区）
+bool compute_app_hash(uint8_t out32[DIGEST_LEN]);
+
+// SLH-DSA 验证主入口（适配你引入的库）
+bool slh_dsa_verify(const uint8_t *pubkey, size_t pk_len,
+                    const uint8_t digest[DIGEST_LEN],
+                    const uint8_t *sig, size_t sig_len);
+
+// 顶层封装：读取 OTP 公钥 + 读取签名 + 计算哈希 + 调用验证
+bool verify_firmware_signature(void);
+```
+
+```c
+// slh_verify.c
+#include "slh_verify.h"
+#include "flash.h"
+#include <string.h>
+
+// 如果你有 SAC 硬件 SHA-256 驱动，请在此处包含并改写 slh_hash_* 三函数
+// #include "sac_sha256_hal.h"
+
+static inline void read_flash(uint32_t addr, void *buf, size_t len) {
+    memcpy(buf, (const void*)addr, len); // 片上 Flash 可直接映射；若需，替换为 HAL 读
+}
+
+bool slh_hash_init(void)   { /* init SAC SHA256 or software */ return true; }
+bool slh_hash_update(const uint8_t *data, size_t len) { /* feed blocks */ return true; }
+bool slh_hash_final(uint8_t out32[DIGEST_LEN])        { /* final */ return true; }
+
+// 计算 APP_HASH_START..APP_HASH_END-1 的 SHA-256
+bool compute_app_hash(uint8_t out32[DIGEST_LEN]) {
+    if (!slh_hash_init()) return false;
+    uint32_t addr = APP_HASH_START;
+    uint32_t remain = APP_HASH_SIZE;
+    while (remain) {
+        uint8_t chunk[512];
+        uint32_t n = (remain > sizeof(chunk)) ? sizeof(chunk) : remain;
+        read_flash(addr, chunk, n);
+        if (!slh_hash_update(chunk, n)) return false;
+        addr += n; remain -= n;
+    }
+    return slh_hash_final(out32);
+}
+
+// ★ 这里是你接入 SLH-DSA 库的地方
+bool slh_dsa_verify(const uint8_t *pubkey, size_t pk_len,
+                    const uint8_t digest[DIGEST_LEN],
+                    const uint8_t *sig, size_t sig_len)
+{
+    // TODO: 替换为实际库：返回 true=验签成功
+    // 例如：return slh_dsa_sha2_128s_verify(pubkey, pk_len, digest, sig, sig_len);
+    return false; // 先占位，避免误放行
+}
+
+bool verify_firmware_signature(void)
+{
+    // 1) 读取 OTP 公钥
+    uint8_t pubkey[64];            // 依据你的参数集调整长度
+    if (!otp_read_pubkey(pubkey, sizeof(pubkey))) return false;
+
+    // 2) 读取签名（从 SIGN_FLASH_BASE 起，建议签名格式第一字节/前4字节是长度）
+    uint32_t sig_len = 0;
+    read_flash(SIGN_FLASH_BASE, &sig_len, sizeof(sig_len));
+    if (sig_len == 0 || sig_len > SIGN_MAX_LEN - 4) return false;
+    const uint8_t *sig_ptr = (const uint8_t *)(SIGN_FLASH_BASE + 4);
+
+    // 3) 计算固件哈希（排除签名区）
+    uint8_t digest[DIGEST_LEN] = {0};
+    if (!compute_app_hash(digest)) return false;
+
+    // 4) 调用 SLH-DSA 验证
+    return slh_dsa_verify(pubkey, sizeof(pubkey), digest, sig_ptr, sig_len);
+}
+```
+
+> 说明：签名区第一 DWORD 存“签名长度”，其后紧跟签名体；这样 XMODEM 接收完可以在 `xmodem_receive_to()` 末尾写入长度头。
+
+## 2) `otp.h/.c`（从 OTP 读取公钥）
+
+```c
+// otp.h
+#pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+bool otp_read_pubkey(uint8_t *buf, size_t len);
+```
+
+```c
+// otp.c
+#include "otp.h"
+
+// TODO: 用你芯片的 OTP 读接口替换此处
+// 若 OTP 中存的是公钥哈希，而公钥实际内置于 Bootloader，则改为读取哈希并比较
+
+#define OTP_PUBKEY_ADDR /* 芯片手册给定的OTP地址 */ 0x1FFF F800  // 示例占位
+bool otp_read_pubkey(uint8_t *buf, size_t len)
+{
+    // 直接内存映射读取，或用厂商 HAL API（优先 HAL）
+    const uint8_t *p = (const uint8_t *)OTP_PUBKEY_ADDR;
+    // 需确保 OTP 中写入的公钥长度与你的参数集一致
+    for (size_t i=0; i<len; ++i) buf[i] = p[i];
+    return true;
+}
+```
+
+> 如果 OTP 容量有限，推荐存 **公钥哈希（32字节）**，Bootloader 常量区放公钥本体，启动时“OTP 哈希 == 常量公钥哈希”即为通过，再用该公钥做验签。这样更节省 OTP。
+
+---
+
+# 五、XMODEM 接收签名时的小改动
+
+为了让 `xmodem_receive_to()` 能写入“长度 + 签名体”，你有两种办法：
+
+* **办法 A（推荐）**：在 PC 端先构造一个 `sig.bin = [4字节长度 | 签名体]` 再用 XMODEM 发送；Boot 不用改。
+* **办法 B**：让 Bootloader 在 XMODEM 结束（收完 `EOT`，已知实际写入字节数）后，把长度回填到 `SIGN_FLASH_BASE` 前 4 字节（需多一步 Flash 擦/写，略麻烦）。
+
+我示例按 **办法 A** 处理：Boot 端只管把 `sig.bin` 原样存入签名区。
+
+---
+
+# 六、JumpApp 的健壮化（可选增强）
+
+你现在的 `JumpApp()` 直接把 `USER_FLASH_BASE` 当函数地址调用。RISC-V 上建议：
+
+* 关闭中断
+* 根据应用的链接脚本设置 `mtvec`（如果应用使用中断）
+* 可选：设置 `mstatus.MPP` 等权限位（视 SDK）
+* 跳到应用的 `_start`/`Reset_Handler`（由应用链接脚本导出符号）
+
+若想最小改动，保留现状即可；但推荐完善：
+
+```c
+extern void set_mtvec(uint32_t addr); // 由你的芯片HAL提供，或用内联汇编
+void JumpApp(void)
+{
+    __disable_irq();
+    set_mtvec(USER_FLASH_BASE);   // 如果需要
+    // 如应用入口不在 USER_FLASH_BASE，而在偏移处，请按应用导出的入口符号改
+    ((void (*)(void))USER_FLASH_BASE)();
+}
+```
+
+---
+
+# 七、把“CRC 时代的验收点”替换为“签名校验闸”
+
+* 以前：下载成功 -> 可直接跳应用
+* 现在：**下载固件 + 下载签名 -> 验签通过 -> 才能跳应用**
+* 失败：停留在 IAP 菜单，便于重新下载
+
+---
+
+# 八、硬件加速与看门狗（建议）
+
+* 如有 **SAC/SHA-256**，在 `slh_hash_*` 中用硬件接口替代软件 SHA，验签耗时会大幅下降。
+* 验签前临时 **停止/喂狗**，避免长时间哈希导致 WDT 复位。
+
+---
+
+# 九、快速检查表（拷完代码后的自检）
+
+1. `flash.h` 出现 `SIGN_FLASH_BASE/SIGN_FLASH_SIZE` 等宏
+2. `xmodem.h/.c` 包含 `xmodem_receive_to()`，且能把 `sig.bin` 写到签名区
+3. `menu.c` 的菜单有 “3: Download signature” 和 `verify_firmware_signature()` 调用
+4. `main.c` 的自动启动路径也调用了 `verify_firmware_signature()`
+5. 新增 `slh_verify.h/.c`、`otp.h/.c`，占位实现可编译通过
+6. 你接入真实 **SLH-DSA** 库：把 `slh_dsa_verify()` 的 `TODO` 换成库调用；`slh_hash_*` 用硬件 SHA
+
+---
+
+# 十、发送/使用流程（操作者视角）
+
+1. 选择菜单 **1**，发送 `IAP_User.bin`（XMODEM）。
+2. 选择菜单 **3**，发送 `sig.bin`（内容为 `[4B长度|签名体]`）。
+3. 选择菜单 **2**，Bootloader 先 **验签** → 通过则跳应用；不通过则提示失败并留在菜单。
+4. 无按键上电：自动走 **验签→跳转**；失败进入 IAP 菜单。
+
+---
+
+如果你把 **SLH-DSA** 的具体库（参数集、接口名）告诉我，我可以把 `slh_dsa_verify()` 和 `slh_hash_*` 直接改写成**可编译的对接代码**（含必要的 `#include` 和类型映射）。此外，若 OTP 的实际寄存器/地址和读法与我示例不同，也可以把对应手册片段或宏名发我，我会把 `otp_read_pubkey()` 改成你板上能跑的版本。
+
+

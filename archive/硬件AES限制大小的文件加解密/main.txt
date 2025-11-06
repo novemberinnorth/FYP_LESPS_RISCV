@@ -1,0 +1,916 @@
+#include <main.h>
+#include "bsp.h"
+#include "cm32m4xxr_aes.h"
+#include "cm32m4xxr_algo_common.h"
+#include <string.h>
+#include <stdio.h>
+
+// 文件流缓冲区定义
+#define FILE_BUFFER_SIZE 1024  // 1KB缓冲区
+#define AES_BLOCK_SIZE 16
+#define countof(a)	(sizeof(a) / sizeof(*(a)))
+
+USART_InitType USART_InitStructure;
+
+// 文件流结构体
+typedef struct {
+    uint8_t buffer[FILE_BUFFER_SIZE];
+    uint32_t read_pos;
+    uint32_t write_pos;
+    uint32_t data_size;
+    uint8_t eof_reached;
+} file_stream_t;
+
+file_stream_t input_stream = {0};
+file_stream_t output_stream = {0};
+
+typedef enum {
+    STATE_IDLE,              // 空闲状态
+    STATE_WAITING_FOR_MODE,  // 等待模式选择
+    STATE_FILE_MODE_READY,   // 文件模式就绪
+    STATE_RECEIVING_FILE,    // 接收文件中
+    STATE_PROCESSING_FILE    // 处理文件中
+} system_state_t;
+
+static system_state_t current_state = STATE_IDLE;
+
+/**
+ * @brief  Configures the different system clocks.
+ */
+void RCC_Configuration(void)
+{
+    /* Enable GPIO clock */
+    GPIO_APBxClkCmd(USARTx_GPIO_CLK | RCC_APB2_PERIPH_AFIO, ENABLE); //enable both GPIOD and AFIO's clock
+
+    /* Enable USARTy and USARTz Clock */
+    USART_APBxClkCmd(USARTx_CLK, ENABLE); //enable UART4 clock
+}
+
+/**
+ * @brief  Configures the different GPIO ports.
+ */
+void GPIO_Configuration(void)
+{
+    GPIO_InitType GPIO_InitStructure;
+    //GPIO_ConfigPinRemap(GPIO_RMP_USART1,ENABLE);
+	GPIO_ConfigPinRemap(GPIO_RMP3_UART4, ENABLE); //UART4 needs to be remapped through GPIO_RMP3_UART4 in order to associate GPIOD0/1 as UART4 pins (user guide P138)
+    /* Configure USARTx Tx as alternate function push-pull */
+    GPIO_InitStructure.Pin        = USARTx_TxPin;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStructure.GPIO_Mode  = GPIO_Mode_AF_PP; //user guide P106
+    GPIO_Init(USARTx_GPIO, &GPIO_InitStructure);
+
+    /* Configure USARTx Rx as input floating */
+    GPIO_InitStructure.Pin       = USARTx_RxPin;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(USARTx_GPIO, &GPIO_InitStructure);
+}
+
+/**
+ * @brief  Compares two buffers.
+ * @param  pBuffer1, pBuffer2: buffers to be compared.
+ * @param  BufferLength buffer's length
+ * @return PASSED: pBuffer1 identical to pBuffer2
+ *         FAILED: pBuffer1 differs from pBuffer2
+ */
+//Status Buffercmp(uint8_t* pBuffer1, uint8_t* pBuffer2, uint16_t BufferLength)
+//{
+//    while (BufferLength--)
+//    {
+//        if (*pBuffer1 != *pBuffer2)
+//        {
+//            return FAILED;
+//        }
+//
+//        pBuffer1++;
+//        pBuffer2++;
+//    }
+//
+//    return PASSED;
+//}
+
+//void DumpWords(const uint32_t *words, uint32_t len) {
+//	for (uint32_t i = 0; i < len; ++i) {
+//		log_info("0x%08x, ", words[i]);
+//	}
+//}
+
+/**
+ * @brief Print the elements of an uint8_t array with hex format and alignment
+ */
+void DumpBytes(const uint8_t *bytes, uint32_t len) {
+	for (uint32_t i = 0; i < len; ++i) {
+		printf("%02x", bytes[i]);
+		if ((i + 1) % 16 == 0) printf("\n");
+		else if ((i + 1) % 4 == 0) printf(" ");
+	}
+	if (len % 16 != 0) printf("\n");
+}
+
+/**
+ * @brief 紧凑格式显示字节数据
+ */
+void dump_bytes_compact(const uint8_t *bytes, uint32_t len) {
+    for (uint32_t i = 0; i < len; ++i) {
+        printf("%02x", bytes[i]);
+    }
+    printf("\n");
+}
+
+/**
+ * @brief  Redefine printf function.
+ */
+int _put_char(int ch)
+{
+	USART_SendData(USARTx, (uint8_t)ch);
+
+	/* Loop until the end of transmission */
+    while (USART_GetFlagStatus(USARTx, USART_FLAG_TXDE) == RESET)
+    {
+
+    }
+
+    return ch;
+}
+/**
+ * @brief  Redefine scanf function.
+ */
+int _get_char(void) {
+    uint32_t timeout = 5000000;
+
+    /* Wait for data reception */
+    while (USART_GetFlagStatus(USARTx, USART_FLAG_RXDNE) == RESET) {
+        timeout--;
+        if (timeout == 0) {
+            return -1; // EOF on timeout
+        }
+    }
+
+    /* Read received data */
+    int ch = (int)USART_ReceiveData(USARTx);
+
+    // Echo the input char
+    _put_char(ch);
+
+    return ch;
+}
+
+/**
+ * @brief 从串口读取文件数据
+ */
+uint32_t read_file_data(uint8_t *data, uint32_t max_len) {
+    uint32_t bytes_read = 0;
+    uint32_t consecutive_timeout = 0;
+    uint32_t max_consecutive_timeout = 1000000; // 增加超时次数
+
+    // 清空接收缓冲区
+    while (USART_GetFlagStatus(USARTx, USART_FLAG_RXDNE) != RESET) {
+        USART_ReceiveData(USARTx); // 丢弃旧数据
+    }
+
+    printf("Waiting for file data...\n");
+
+    while (bytes_read < max_len && consecutive_timeout < max_consecutive_timeout) {
+        if (USART_GetFlagStatus(USARTx, USART_FLAG_RXDNE) != RESET) {
+            data[bytes_read] = USART_ReceiveData(USARTx);
+            bytes_read++;
+            consecutive_timeout = 0; // 重置超时计数器
+
+            // 检查是否收到结束标记
+            if (bytes_read >= 4) {
+                if (memcmp(&data[bytes_read-4], "END\n", 4) == 0) {
+                    printf("Detected END marker\n");
+                    break;
+                }
+                // 检查不带换行符的END
+                if (bytes_read >= 3 && memcmp(&data[bytes_read-3], "END", 3) == 0) {
+                    printf("Detected END marker\n");
+                    break;
+                }
+            }
+        } else {
+            consecutive_timeout++;
+            // 更短的延迟
+            for(volatile int i = 0; i < 100; i++);
+        }
+    }
+
+    if (bytes_read > 0) {
+        printf("File reception completed: %d bytes\n", bytes_read);
+    } else {
+        printf("No data received\n");
+    }
+
+    return bytes_read;
+}
+
+/**
+ * @brief 向串口写入文件数据
+ */
+void write_file_data(uint8_t *data, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++) {
+        USART_SendData(USARTx, data[i]);
+        while (USART_GetFlagStatus(USARTx, USART_FLAG_TXDE) == RESET);
+    }
+    printf("Sent %d bytes\n", len);
+}
+
+/**
+ * @brief 重定向fgetc用于文件输入
+ */
+int fgetc(FILE *stream) {
+    (void)stream; // 避免未使用参数警告
+
+    // 如果缓冲区为空，尝试从串口读取更多数据
+    if (input_stream.read_pos >= input_stream.data_size) {
+        if (input_stream.eof_reached) {
+            return EOF;
+        }
+
+        // 从串口读取数据到缓冲区
+        input_stream.data_size = read_file_data(input_stream.buffer, FILE_BUFFER_SIZE);
+        input_stream.read_pos = 0;
+
+        if (input_stream.data_size == 0) {
+            input_stream.eof_reached = 1;
+            return EOF;
+        }
+    }
+
+    // 返回下一个字节
+    return input_stream.buffer[input_stream.read_pos++];
+}
+
+/**
+ * @brief 重定向fputc用于文件输出
+ */
+int fputc(int ch, FILE *stream) {
+    (void)stream; // 避免未使用参数警告
+
+    // 写入到输出缓冲区
+    if (output_stream.write_pos < FILE_BUFFER_SIZE) {
+        output_stream.buffer[output_stream.write_pos++] = (uint8_t)ch;
+        output_stream.data_size = output_stream.write_pos;
+    }
+
+    // 如果缓冲区满，刷新到串口
+    if (output_stream.write_pos >= FILE_BUFFER_SIZE) {
+        write_file_data(output_stream.buffer, output_stream.write_pos);
+        output_stream.write_pos = 0;
+        output_stream.data_size = 0;
+    }
+
+    return ch;
+}
+
+/**
+ * @brief 刷新输出缓冲区
+ */
+void fflush_output(void) {
+    if (output_stream.write_pos > 0) {
+        write_file_data(output_stream.buffer, output_stream.write_pos);
+        output_stream.write_pos = 0;
+        output_stream.data_size = 0;
+    }
+}
+
+/**
+ * @brief 设置系统状态
+ */
+void set_system_state(system_state_t new_state) {
+    current_state = new_state;
+    printf("System state: %d\n", new_state);
+    fflush_output();
+}
+
+/**
+ * @brief 初始化文件流
+ */
+void init_file_streams(void) {
+    memset(&input_stream, 0, sizeof(input_stream));
+    memset(&output_stream, 0, sizeof(output_stream));
+}
+
+/**
+ * @brief PKCS#7 padding function
+ */
+void pkcs7_padding(uint8_t *data, uint32_t *data_len, uint32_t block_size) {
+    uint8_t pad_value = block_size - (*data_len % block_size);
+    uint32_t original_len = *data_len;
+
+    // Padding
+    for(uint32_t i = original_len; i < original_len + pad_value; i++) {
+        data[i] = pad_value;
+    }
+    *data_len = original_len + pad_value;
+
+    printf("PKCS#7 Padding: original=%d, new=%d\n", original_len, *data_len);
+}
+
+/**
+ * @brief PKCS#7 unpadding function
+ */
+int pkcs7_unpadding(uint8_t *data, uint32_t *data_len) {
+    if (*data_len == 0) {
+        printf("PKCS#7 Unpadding Failure: data length is zero\n");
+        return -1;
+    }
+
+    uint8_t pad_value = data[*data_len - 1];
+
+    // Check if the padding value is valid
+    if (pad_value == 0 || pad_value > *data_len) {
+    	printf("PKCS#7 Unpadding Failure: invalid padding value 0x%02x\n", pad_value);
+        return -1;
+    }
+
+    // Check if the padding value meets the padding length
+    for (uint32_t i = *data_len - pad_value; i < *data_len; i++) {
+        if (data[i] != pad_value) {
+        	printf("PKCS#7 Unpadding Failure: padding value doesn't match padding length\n");
+            return -1;
+        }
+    }
+
+    *data_len -= pad_value;
+    printf("PKCS#7 Unpadding: original=%d\n", *data_len);
+    return 0;
+}
+
+/**
+ * @brief AES CBC encode/decode with scanf and customised plain text
+ */
+int aes_cbc_interactive(void)
+{
+    // 固定密钥和IV
+    __attribute__ ((aligned (4))) uint8_t key[16] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
+    };
+
+    __attribute__ ((aligned (4))) uint8_t iv[16] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
+    };
+
+    // 缓冲区定义
+    __attribute__ ((aligned (4))) uint8_t plaintext[256];
+    __attribute__ ((aligned (4))) uint8_t padded_plaintext[256];
+    __attribute__ ((aligned (4))) uint8_t ciphertext[256];
+    __attribute__ ((aligned (4))) uint8_t decrypted_text[256];
+    __attribute__ ((aligned (4))) uint8_t final_text[256];
+
+    AES_PARM AES_Parm = { 0 };
+
+    printf("AES CBC Interactive\n");
+
+    // 1. 读取用户输入的明文
+    printf("Input plaintext: ");
+    delay_ms(2000);
+
+    int i = 0;
+    int ch;
+    while ((ch = _get_char()) != '\r' && ch != '\n' && ch != -1 && i < 127) {
+        if (ch == '\b' || ch == 127) { // 处理退格键
+            if (i > 0) {
+                i--;
+                printf("\b \b"); // 回退显示
+            }
+        } else {
+            plaintext[i++] = (uint8_t)ch;
+            printf("%c", ch); // 回显
+        }
+    }
+    plaintext[i] = '\0'; // 字符串结束符
+    printf("\n");
+
+    uint32_t original_len = i;
+    uint32_t padded_len = original_len;
+
+    printf("Original plaintext: \"%s\"\n", plaintext);
+
+    // 2. PKCS#7填充
+    memcpy(padded_plaintext, plaintext, original_len);
+    pkcs7_padding(padded_plaintext, &padded_len, 16);
+
+    // 3. AES CBC加密
+    AES_Parm.in = (uint32_t*) padded_plaintext;
+    AES_Parm.out = (uint32_t*) ciphertext;
+    AES_Parm.key = (uint32_t*) key;
+    AES_Parm.iv = (uint32_t*) iv;
+    AES_Parm.inWordLen = padded_len / sizeof(uint32_t);
+    AES_Parm.keyWordLen = sizeof(key) / sizeof(uint32_t);
+    AES_Parm.Mode = AES_CBC;
+    AES_Parm.En_De = AES_ENC;
+
+    if (AES_Init_OK != AES_Init(&AES_Parm)) {
+        printf("AES init failed\n");
+        return -1;
+    }
+
+    if (AES_Crypto_OK != AES_Crypto(&AES_Parm)) {
+        AES_Close();
+        printf("AES encrypt failed\n");
+        return -1;
+    }
+    AES_Close();
+
+    printf("Ciphered text:\n");
+    DumpBytes(ciphertext, padded_len);
+
+    // 4. AES CBC解密
+    AES_Parm.in = (uint32_t*) ciphertext;
+    AES_Parm.out = (uint32_t*) decrypted_text;
+    AES_Parm.En_De = AES_DEC;
+
+    if (AES_Init_OK != AES_Init(&AES_Parm)) {
+    	printf("AES init failed\n");
+        return -1;
+    }
+
+    if (AES_Crypto_OK != AES_Crypto(&AES_Parm)) {
+        AES_Close();
+        printf("AES decrypt failed\n");
+        return -1;
+    }
+    AES_Close();
+
+    // 5. PKCS#7去填充
+    uint32_t final_len = padded_len;
+    memcpy(final_text, decrypted_text, padded_len);
+
+    if (pkcs7_unpadding(final_text, &final_len) != 0) {
+        printf("Unpadding failed\n");
+        return -1;
+    }
+
+    final_text[final_len] = '\0';  // 重新添加终止符，避免printf继续读取内存导致输出乱码
+
+    printf("Unpadded text: \"%s\"\n", final_text);
+
+    // 6. 与原明文对比
+    if (final_len != original_len || memcmp(plaintext, final_text, original_len) != 0) {
+        printf("Result mismatch\n");
+        return -1;
+    }
+
+    printf("Result matches\n");
+
+    return 0;
+}
+
+/**
+ * @brief 发送加密数据回PC（使用Base64编码避免二进制干扰）
+ */
+void send_encrypted_data_base64(uint8_t *cipher_block, uint32_t len) {
+    // Base64编码表
+    const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    uint8_t encoded_data[25]; // 16字节编码为24字节Base64 + null终止符
+
+    int i, j;
+    uint32_t triple;
+
+    for (i = 0, j = 0; i < len; i += 3) {
+        // 将3个字节组合成24位
+        triple = (cipher_block[i] << 16);
+        if (i + 1 < len) triple |= (cipher_block[i + 1] << 8);
+        if (i + 2 < len) triple |= cipher_block[i + 2];
+
+        // 转换为4个Base64字符
+        encoded_data[j++] = base64_chars[(triple >> 18) & 0x3F];
+        encoded_data[j++] = base64_chars[(triple >> 12) & 0x3F];
+        encoded_data[j++] = (i + 1 < len) ? base64_chars[(triple >> 6) & 0x3F] : '=';
+        encoded_data[j++] = (i + 2 < len) ? base64_chars[triple & 0x3F] : '=';
+    }
+    encoded_data[j] = '\0'; // 终止字符串
+
+    printf("B64:");
+    for (int k = 0; k < j; k++) {
+        fputc(encoded_data[k], stdout);
+    }
+    printf("\n");
+    fflush_output();
+}
+
+/**
+ * @brief 解析并提取纯文件内容 - 修复版本
+ */
+uint32_t extract_file_content(uint8_t *received_data, uint32_t received_len, uint8_t *file_content) {
+    uint32_t file_content_len = 0;
+
+    printf("Parsing received data (%d bytes)...\n", received_len);
+
+    // 查找"SIZE:"前缀
+    if (received_len >= 5 && memcmp(received_data, "SIZE:", 5) == 0) {
+        printf("Detected header\n");
+
+        uint32_t pos = 5;
+        uint32_t declared_size = 0;
+
+        // 解析文件大小
+        while (pos < received_len &&
+               received_data[pos] >= '0' &&
+               received_data[pos] <= '9') {
+            declared_size = declared_size * 10 + (received_data[pos] - '0');
+            pos++;
+        }
+
+        printf("Declared size: %d bytes\n", declared_size);
+
+        // 跳过换行符（可能是\n或\r\n）
+        if (pos < received_len && received_data[pos] == '\r') pos++;
+        if (pos < received_len && received_data[pos] == '\n') pos++;
+
+        printf("Content starts at %d\n", pos);
+
+        // 查找结束标记"END"（考虑不同的位置）
+        uint32_t content_end = received_len;
+        uint32_t end_pos = 0;
+
+        // 查找所有可能的END位置
+        for (uint32_t i = pos; i <= received_len - 3; i++) {
+            if (memcmp(&received_data[i], "END", 3) == 0) {
+                end_pos = i;
+                printf("Found END at %d\n", i);
+                break;
+            }
+        }
+
+        if (end_pos > pos) {
+            // 使用END标记之前的内容
+            file_content_len = end_pos - pos;
+            printf("Content length: %d bytes\n", file_content_len);
+
+            if (file_content_len <= declared_size) {
+                memcpy(file_content, &received_data[pos], file_content_len);
+
+                if (file_content_len == declared_size) {
+                    printf("Extracted %d bytes (matches)\n", file_content_len);
+                } else {
+                    printf("Size mismatch: declared=%d, actual=%d\n", declared_size, file_content_len);
+                }
+            } else {
+                // 如果实际内容比声明的大，使用声明的大小
+                file_content_len = declared_size;
+                memcpy(file_content, &received_data[pos], file_content_len);
+                printf("Using declared size: %d bytes\n", file_content_len);
+            }
+        } else {
+            // 没有找到END标记，使用声明的大小
+            printf("END not found\n");
+            if (pos + declared_size <= received_len) {
+                file_content_len = declared_size;
+                memcpy(file_content, &received_data[pos], file_content_len);
+                printf("Using declared size: %d bytes\n", file_content_len);
+            } else {
+                // 如果声明的大小超过实际数据，使用剩余的所有数据
+                file_content_len = received_len - pos;
+                memcpy(file_content, &received_data[pos], file_content_len);
+                printf("Using remaining data: %d bytes\n", file_content_len);
+            }
+        }
+    } else {
+        // 没有协议头，假设全部是文件内容
+        printf("No header, using all data\n");
+        memcpy(file_content, received_data, received_len);
+        file_content_len = received_len;
+    }
+
+    return file_content_len;
+}
+
+/**
+ * @brief 增强版文件处理，支持协议解析 - 修复版本
+ */
+void process_file_aes_cbc(void) {
+    set_system_state(STATE_RECEIVING_FILE);
+
+    // 固定密钥和IV
+    __attribute__ ((aligned (4))) uint8_t key[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+    __attribute__ ((aligned (4))) uint8_t iv[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+
+    AES_PARM AES_Parm = {0};
+
+    printf("AES CBC WITH PROTOCOL\n");
+
+    // 增大接收缓冲区
+    uint8_t raw_buffer[512];
+    printf("Receive buffer: %d bytes\n", sizeof(raw_buffer));
+    fflush_output();
+
+    // 添加接收超时控制
+    printf("Starting reception...\n");
+    fflush_output();
+
+    uint32_t raw_len = read_file_data(raw_buffer, sizeof(raw_buffer));
+
+    if (raw_len == 0) {
+        printf("No data received\n");
+        set_system_state(STATE_IDLE);
+        return;
+    }
+
+    set_system_state(STATE_PROCESSING_FILE);
+
+    // 提取纯文件内容
+    uint8_t file_content[512];
+    uint32_t file_size = extract_file_content(raw_buffer, raw_len, file_content);
+
+    if (file_size == 0) {
+        printf("Failed to extract content\n");
+        set_system_state(STATE_IDLE);
+        return;
+    }
+
+    printf("File size: %d bytes\n", file_size);
+
+    // 验证文件内容
+    if (file_size != 20) {
+        printf("Expected 20 bytes, got %d\n", file_size);
+    }
+
+    // 继续AES处理流程...
+    printf("STARTING AES PROCESSING\n");
+
+    uint32_t total_processed = 0;
+    uint32_t block_count = 0;
+    uint8_t current_iv[16];
+    memcpy(current_iv, iv, 16);
+
+    // 存储解密结果用于最终验证
+    uint8_t decrypted_data[512];
+    uint32_t decrypted_len = 0;
+
+    // 处理每个块
+    while (total_processed < file_size) {
+        block_count++;
+        uint32_t remaining = file_size - total_processed;
+        uint32_t block_size = (remaining >= 16) ? 16 : remaining;
+
+        printf("BLOCK %d: %d bytes\n", block_count, block_size);
+
+        // 提取当前块
+        uint8_t input_block[16] = {0};
+        uint8_t padded_block[16] = {0};
+        uint8_t cipher_block[16] = {0};
+        uint8_t decrypted_block[16] = {0};
+
+        memcpy(input_block, &file_content[total_processed], block_size);
+
+        // PKCS#7填充（如果是最后一个块）
+        uint32_t padded_len = block_size;
+        int is_final_block = (remaining <= 16);
+
+        if (is_final_block && block_size < 16) {
+            memcpy(padded_block, input_block, block_size);
+            pkcs7_padding(padded_block, &padded_len, 16);
+            printf("Final block padded\n");
+        } else {
+            memcpy(padded_block, input_block, block_size);
+            padded_len = block_size;
+        }
+
+        // AES CBC加密
+        printf("Encrypting block...\n");
+        AES_Parm.in = (uint32_t*)padded_block;
+        AES_Parm.out = (uint32_t*)cipher_block;
+        AES_Parm.key = (uint32_t*)key;
+        AES_Parm.iv = (uint32_t*)current_iv;
+        AES_Parm.inWordLen = padded_len / sizeof(uint32_t);
+        AES_Parm.keyWordLen = sizeof(key) / sizeof(uint32_t);
+        AES_Parm.Mode = AES_CBC;
+        AES_Parm.En_De = AES_ENC;
+
+        if (AES_Init_OK != AES_Init(&AES_Parm)) {
+            printf("AES init failed\n");
+            break;
+        }
+
+        if (AES_Crypto_OK != AES_Crypto(&AES_Parm)) {
+            AES_Close();
+            printf("AES encrypt failed\n");
+            break;
+        }
+        AES_Close();
+
+        printf("Encrypted (hex): ");
+        dump_bytes_compact(cipher_block, 16);
+
+        // 发送加密数据回PC（使用Base64编码避免二进制干扰）
+        printf("Sending encrypted (Base64)...\n");
+
+        // 简单的Base64编码（避免二进制数据干扰）
+        send_encrypted_data_base64(cipher_block, 16);
+
+        // AES CBC解密验证
+        printf("Decrypting for verification...\n");
+        AES_Parm.in = (uint32_t*)cipher_block;
+        AES_Parm.out = (uint32_t*)decrypted_block;
+        AES_Parm.En_De = AES_DEC;
+
+        if (AES_Init_OK != AES_Init(&AES_Parm)) {
+            printf("AES init failed\n");
+            break;
+        }
+
+        if (AES_Crypto_OK != AES_Crypto(&AES_Parm)) {
+            AES_Close();
+            printf("AES decrypt failed\n");
+            break;
+        }
+        AES_Close();
+
+        // 去填充验证（如果是最后一个块）
+        uint32_t final_len = 16;
+        if (is_final_block && block_size < 16) {
+            if (pkcs7_unpadding(decrypted_block, &final_len) == 0) {
+                printf("Unpadded to %d bytes\n", final_len);
+            } else {
+                printf("Unpadding failed\n");
+            }
+        }
+
+        // 存储解密结果
+        uint32_t copy_len = (is_final_block && block_size < 16) ? final_len : block_size;
+        memcpy(&decrypted_data[decrypted_len], decrypted_block, copy_len);
+        decrypted_len += copy_len;
+
+        // 更新IV（CBC模式）
+        memcpy(current_iv, cipher_block, 16);
+
+        total_processed += block_size;
+
+        // 修复进度显示
+        int progress_percent = (total_processed * 100) / file_size;
+        printf("Progress: %d%%\n", progress_percent);
+    }
+
+    // 刷新输出缓冲区
+    fflush_output();
+
+    printf("PROCESSING SUMMARY\n");
+    printf("File processing completed\n");
+    printf("Blocks: %d, Bytes: %d\n", block_count, total_processed);
+
+    // 验证完整性
+    printf("INTEGRITY VERIFICATION\n");
+    if (decrypted_len == file_size) {
+        printf("Length matches: %d bytes\n", file_size);
+
+        if (memcmp(file_content, decrypted_data, file_size) == 0) {
+            printf("SUCCESS: Matches original\n");
+        } else {
+            printf("WARNING: Differs from original\n");
+        }
+    } else {
+        printf("LENGTH MISMATCH: original=%d, decrypted=%d\n", file_size, decrypted_len);
+    }
+
+    // 处理完成后重置状态
+	set_system_state(STATE_IDLE);
+}
+
+/**
+ * @brief 简单的文件传输测试
+ */
+void test_file_transfer(void) {
+    printf("File Transfer Test\n");
+
+    init_file_streams();
+
+    printf("Ready to receive...\n");
+
+    uint32_t total_received = 0;
+    uint8_t buffer[64];
+
+    while (1) {
+        uint32_t bytes_read = read_file_data(buffer, sizeof(buffer));
+        if (bytes_read == 0) {
+            break;
+        }
+
+        total_received += bytes_read;
+
+        printf("Received %d bytes\n", bytes_read);
+
+        // 发送确认
+        write_file_data((uint8_t*)"ACK\n", 4);
+    }
+
+    printf("Test completed. Total: %d bytes\n", total_received);
+}
+
+/**
+ * @brief 响应PC端的握手检测
+ */
+void respond_to_handshake(void) {
+    // 检查是否有握手字符
+    if (USART_GetFlagStatus(USARTx, USART_FLAG_RXDNE) != RESET) {
+        int ch = USART_ReceiveData(USARTx);
+        if (ch == '?') {
+            // 发送就绪信号
+            printf("READY\n");
+            fflush_output();
+        }
+    }
+}
+
+int main(void) {
+    /* SystemInit() function has been called by startup file startup_cm32m4xxr.s */
+    /* System Clocks Configuration */
+    RCC_Configuration();
+
+    /* Configure the GPIO ports */
+    GPIO_Configuration();
+
+    /* USART configuration */
+    USART_InitStructure.BaudRate            = 115200;
+    USART_InitStructure.WordLength          = USART_WL_8B;
+    USART_InitStructure.StopBits            = USART_STPB_1;
+    USART_InitStructure.Parity              = USART_PE_NO;
+    USART_InitStructure.HardwareFlowControl = USART_HFCTRL_NONE;
+    USART_InitStructure.Mode                = USART_MODE_RX | USART_MODE_TX;
+
+    /* Configure USARTx */
+    USART_Init(USARTx, &USART_InitStructure);
+
+    /* Enable the USARTx */
+    USART_Enable(USARTx, ENABLE);
+
+    // 初始化状态
+    set_system_state(STATE_IDLE);
+
+    printf("MCU Startup Successful!\n");
+    fflush_output();
+
+    // 等待握手信号
+    printf("Waiting for handshake...\n");
+    uint32_t handshake_timeout = 5000000; // 5秒超时
+    while (handshake_timeout-- > 0) {
+        respond_to_handshake();
+        // 简化版：直接响应任何输入
+        if (USART_GetFlagStatus(USARTx, USART_FLAG_RXDNE) != RESET) {
+            USART_ReceiveData(USARTx); // 清空接收缓冲区
+            printf("READY\n");
+            fflush_output();
+            break;
+        }
+    }
+
+    // 显示主菜单
+    printf("File Stream AES CBC Processor\n");
+    printf("Options:\n1. Interactive ('i')\n2. File ('f')\n3. Transfer test ('t')\n");
+    printf("Choose mode: ");
+    fflush_output();
+
+    set_system_state(STATE_WAITING_FOR_MODE);
+
+    int choice = _get_char();
+    printf("%c\n", choice);
+    fflush_output();
+
+    switch (choice) {
+        case 'i':
+        case 'I':
+            printf("Starting Interactive Mode...\n");
+            if (aes_cbc_interactive() == 0) {
+                printf("Interactive completed successfully.\n");
+            } else {
+                printf("Interactive failed.\n");
+            }
+            break;
+
+        case 'f':
+        case 'F':
+            printf("Starting File-based Mode...\n");
+            set_system_state(STATE_FILE_MODE_READY);
+            printf("Ready to receive file\n");
+            fflush_output();
+
+            // 添加一个短暂的等待，确保Python端准备好
+            for(volatile int i = 0; i < 500000; i++);
+
+            process_file_aes_cbc();
+            break;
+
+        case 't':
+        case 'T':
+            printf("Starting Transfer Test...\n");
+            test_file_transfer();
+            break;
+
+        default:
+            printf("Invalid choice. Running interactive.\n");
+            if (aes_cbc_interactive() == 0) {
+                printf("Interactive completed successfully.\n");
+            }
+            break;
+    }
+
+    // 完成后重置状态
+    set_system_state(STATE_IDLE);
+    printf("System reset to idle\n");
+    fflush_output();
+
+    while (1) {
+        // 主循环
+    }
+}
