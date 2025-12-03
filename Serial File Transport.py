@@ -3,770 +3,844 @@ import time
 import os
 import base64
 import struct
+import secrets
+import sys
 
 BaudRate = 115200
+CHUNK_SIZE = 1024
+default_input = "1.txt"
+default_ciphertext = "encrypted.bin"
+default_output = "output.txt"
 
-# NIST测试向量
-NIST_TEST_VECTORS = {
-    "CBC-AES128-Encrypt": {
-        "key": bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c"),
-        "iv": bytes.fromhex("000102030405060708090a0b0c0d0e0f"),
-        "blocks": [
-            {
-                "plaintext": bytes.fromhex("6bc1bee22e409f96e93d7e117393172a"),
-                "ciphertext": bytes.fromhex("7649abac8119b246cee98e9b12e9197d")
-            },
-            {
-                "plaintext": bytes.fromhex("ae2d8a571e03ac9c9eb76fac45af8e51"), 
-                "ciphertext": bytes.fromhex("5086cb9b507219ee95db113a917678b2")
-            },
-            {
-                "plaintext": bytes.fromhex("30c81c46a35ce411e5fbc1191a0a52ef"),
-                "ciphertext": bytes.fromhex("73bed6b8e3c1743b7116e69e22229516")
-            },
-            {
-                "plaintext": bytes.fromhex("f69f2445df4f9b17ad2b417be66c3710"),
-                "ciphertext": bytes.fromhex("3ff1caa1681fac09120eca307586e1a7")
-            }
-        ]
-    },
-    "CBC-AES128-Decrypt": {
-        "key": bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c"),
-        "iv": bytes.fromhex("000102030405060708090a0b0c0d0e0f"),
-        "blocks": [
-            {
-                "ciphertext": bytes.fromhex("7649abac8119b246cee98e9b12e9197d"),
-                "plaintext": bytes.fromhex("6bc1bee22e409f96e93d7e117393172a")
-            },
-            {
-                "ciphertext": bytes.fromhex("5086cb9b507219ee95db113a917678b2"),
-                "plaintext": bytes.fromhex("ae2d8a571e03ac9c9eb76fac45af8e51")
-            },
-            {
-                "ciphertext": bytes.fromhex("73bed6b8e3c1743b7116e69e22229516"),
-                "plaintext": bytes.fromhex("30c81c46a35ce411e5fbc1191a0a52ef")
-            },
-            {
-                "ciphertext": bytes.fromhex("3ff1caa1681fac09120eca307586e1a7"),
-                "plaintext": bytes.fromhex("f69f2445df4f9b17ad2b417be66c3710")
-            }
-        ]
-    }
-}
-
-def nist_standard_test(port, test_name):
-    """NIST标准化测试向量验证 - 完整数据块版本"""
-    print(f"=== Starting NIST Standard Test: {test_name} ===")
-    
-    if test_name not in NIST_TEST_VECTORS:
-        print(f"Unknown test: {test_name}")
-        return False
-    
-    test_data = NIST_TEST_VECTORS[test_name]
-    is_encrypt = "Encrypt" in test_name
-    
+def hex_string_to_bytes(hex_str):
+    """将16进制字符串转换为字节"""
     try:
-        ser = serial.Serial(port, BaudRate, timeout=10, dsrdtr=False,  
-                          write_timeout=10, xonxoff=False, rtscts=False)
+        # 移除可能的空格和0x前缀
+        hex_str = hex_str.strip().replace(' ', '').replace('0x', '').replace('0X', '')
+        if len(hex_str) == 0:
+            return None
+        if len(hex_str) % 2 != 0:
+            # 奇数长度，可能缺少前导0
+            hex_str = '0' + hex_str
+        return bytes.fromhex(hex_str)
+    except Exception as e:
+        print(f"错误: 无效的16进制字符串: {e}")
+        return None
+
+def get_user_key():
+    """获取用户输入的密钥"""
+    while True:
+        key_input = input("输入16字节密钥(16进制, 32个字符, 如: 00112233445566778899AABBCCDDEEFF, 回车使用默认): ").strip()
+        if key_input == "":
+            # 使用默认密钥
+            default_key = bytes([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
+            print(f"使用默认密钥: {default_key.hex().upper()}")
+            return default_key
         
-        # 等待MCU启动完成
-        print("Waiting for MCU to be ready...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'READY' in line:
-                    print("MCU is ready")
-                    break
-        
-        # 选择新的流式处理模式
-        print("Selecting new stream mode...")
-        ser.write(b'n')
-        ser.flush()
-        
-        # 等待MCU进入新模式
-        print("Waiting for MCU to enter new stream mode...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'NEW_STREAM_MODE' in line:
-                    print("MCU entered new stream mode")
-                    break
-        
-        # 等待操作选择提示
-        print("Waiting for operation prompt...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'WAIT_OPERATION' in line:
-                    print("Sending operation...")
-                    break
-        
-        # 发送操作模式
-        if is_encrypt:
-            ser.write(b'e')
-            print("Sent operation: encrypt")
-        else:
-            ser.write(b'd')
-            print("Sent operation: decrypt")
-        ser.flush()
-        
-        # 等待确认
-        print("Waiting for ACK...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'ACK' in line:
-                    print("Operation accepted")
-                    break
-        
-        # 发送密钥
-        print("Sending key...")
-        key = test_data["key"]
-        ser.write(key)
-        ser.flush()
-        
-        # 等待密钥确认
-        print("Waiting for key ACK...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'ACK' in line:
-                    print("Key accepted")
-                    break
-        
-        # 发送IV
-        print("Sending IV...")
-        iv = test_data["iv"]
-        ser.write(iv)
-        ser.flush()
-        
-        # 等待IV确认
-        print("Waiting for IV ACK...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'ACK' in line:
-                    print("IV accepted")
-                    break
-        
-        # 准备完整的测试数据（64字节）
-        if is_encrypt:
-            # 合并所有明文块
-            input_data = b''.join([block["plaintext"] for block in test_data["blocks"]])
-            expected_output = b''.join([block["ciphertext"] for block in test_data["blocks"]])
-            print(f"Complete Plaintext:  {input_data.hex()}")
-            print(f"Expected Ciphertext: {expected_output.hex()}")
-        else:
-            # 合并所有密文块
-            input_data = b''.join([block["ciphertext"] for block in test_data["blocks"]])
-            expected_output = b''.join([block["plaintext"] for block in test_data["blocks"]])
-            print(f"Complete Ciphertext: {input_data.hex()}")
-            print(f"Expected Plaintext:  {expected_output.hex()}")
-        
-        # 发送文件大小 (64字节)
-        file_size = len(input_data)
-        size_data = struct.pack('>I', file_size)
-        ser.write(size_data)
-        ser.flush()
-        
-        # 等待文件大小确认
-        print("Waiting for file size ACK...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'ACK' in line:
-                    print("File size accepted")
-                    break
-        
-        # 等待数据就绪
-        print("Waiting for MCU to be ready for data...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'READY_FOR_DATA' in line:
-                    print("MCU is ready for data")
-                    break
-        
-        # 等待块请求
-        print("Waiting for chunk request...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'WAIT_CHUNK' in line:
-                    requested_size = int(line.split(':')[1])
-                    print(f"Sending {requested_size} bytes data chunk...")
-                    break
-        
-        # 发送完整数据
-        bytes_sent = 0
-        block_size = 64  # 每次发送64字节
-        while bytes_sent < len(input_data):
-            end_pos = min(bytes_sent + block_size, len(input_data))
-            block = input_data[bytes_sent:end_pos]
-            ser.write(block)
-            ser.flush()
-            bytes_sent += len(block)
-            time.sleep(0.02)
-        
-        # 等待处理结果
-        print("Waiting for processed data...")
-        start_time = time.time()
-        actual_output = b''
-        
-        while time.time() - start_time < 30:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                
-                if line.startswith('B64:'):
-                    b64_data = line[4:]
-                    try:
-                        # Base64解码
-                        padding_needed = len(b64_data) % 4
-                        if padding_needed:
-                            b64_data += '=' * (4 - padding_needed)
-                        chunk_output = base64.b64decode(b64_data)
-                        actual_output += chunk_output
-                        print(f"Received chunk: {len(chunk_output)} bytes")
-                        
-                    except Exception as e:
-                        print(f"Base64 decode error: {e}")
-                
-                if 'STREAM_COMPLETE' in line:
-                    print("Stream completed")
-                    break
-        
-        print(f"Complete Actual Output: {actual_output.hex()}")
-        
-        # 验证完整结果
-        if actual_output == expected_output:
-            print("✓ ALL BLOCKS PASS - Complete test successful")
-            return True
-        else:
-            print("✗ FAIL - Complete output mismatch")
-            # 分块验证
-            passed_blocks = 0
-            total_blocks = len(test_data["blocks"])
-            for i in range(total_blocks):
-                start_idx = i * 16
-                end_idx = start_idx + 16
-                actual_block = actual_output[start_idx:end_idx] if len(actual_output) >= end_idx else b''
-                
-                if is_encrypt:
-                    expected_block = test_data["blocks"][i]["ciphertext"]
-                    block_type = "Ciphertext"
-                else:
-                    expected_block = test_data["blocks"][i]["plaintext"]
-                    block_type = "Plaintext"
-                
-                if actual_block == expected_block:
-                    print(f"  Block {i+1}: ✓ {block_type} correct")
-                    passed_blocks += 1
-                else:
-                    print(f"  Block {i+1}: ✗ {block_type} mismatch")
-                    print(f"    Expected: {expected_block.hex()}")
-                    print(f"    Actual:   {actual_block.hex()}")
+        key_bytes = hex_string_to_bytes(key_input)
+        if key_bytes is None:
+            print("无效的密钥格式，请重新输入")
+            continue
             
-            print(f"Block-level result: {passed_blocks}/{total_blocks} blocks passed")
+        if len(key_bytes) != 16:
+            print(f"密钥长度必须为16字节，当前为{len(key_bytes)}字节")
+            continue
+            
+        return key_bytes
+
+def get_user_nonce():
+    """获取用户输入的Nonce"""
+    while True:
+        nonce_input = input("输入16字节Nonce(16进制, 32个字符, 回车使用随机生成): ").strip()
+        if nonce_input == "":
+            # 随机生成
+            nonce = secrets.token_bytes(16)
+            print(f"使用随机Nonce: {nonce.hex().upper()}")
+            return nonce
+        
+        nonce_bytes = hex_string_to_bytes(nonce_input)
+        if nonce_bytes is None:
+            print("无效的Nonce格式，请重新输入")
+            continue
+            
+        if len(nonce_bytes) != 16:
+            print(f"Nonce长度必须为16字节，当前为{len(nonce_bytes)}字节")
+            continue
+            
+        return nonce_bytes
+
+def get_user_aad():
+    """获取用户输入的AAD"""
+    while True:
+        aad_input = input("输入AAD(16进制, 回车跳过): ").strip()
+        if aad_input == "":
+            return b""  # 空AAD
+        
+        aad_bytes = hex_string_to_bytes(aad_input)
+        if aad_bytes is None:
+            print("无效的AAD格式，请重新输入")
+            continue
+            
+        return aad_bytes
+
+class GCM_SIV_FileProcessor:
+    def __init__(self, port, verbose=False, show_progress=True):
+        self.port = port
+        self.ser = None
+        self.verbose = verbose
+        self.show_progress = show_progress
+        self.current_chunk = 0
+        self.total_chunks = 0
+        self.total_processed = 0
+        self.total_size = 0
+        
+    def _update_progress(self):
+        """更新进度显示"""
+        if self.show_progress and self.total_size > 0:
+            progress = (self.total_processed / self.total_size) * 100
+            sys.stdout.write(f"\r[{progress:6.2f}%] Chunk {self.current_chunk}/{self.total_chunks}: {self.total_processed}/{self.total_size} bytes\n")
+            sys.stdout.flush()
+
+    def connect(self):
+        """连接到串口设备"""
+        try:
+            self.ser = serial.Serial(self.port, BaudRate, timeout=10, dsrdtr=False,
+                                   write_timeout=10, xonxoff=False, rtscts=False)
+            if self.verbose:
+                print(f"Connected to {self.port}")
+            return True
+        except Exception as e:
+            print(f"Connection error: {e}")
             return False
             
-    except Exception as e:
-        print(f"Error during NIST test: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-    finally:
-        if 'ser' in locals():
-            ser.close()
-
-def new_stream_file_processing_with_key_iv(port, operation, custom_key=None, custom_iv=None):
-    """支持自定义密钥和IV的流式文件处理"""
-    
-    input_file = "input.txt" if operation == "encrypt" else "ciphertext.txt"
-    output_file = "ciphertext.txt" if operation == "encrypt" else "output.txt"
-    
-    # 默认密钥和IV
-    default_key = bytes([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
-    default_iv = bytes([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
-    
-    key = custom_key if custom_key else default_key
-    iv = custom_iv if custom_iv else default_iv
-    
-    if not os.path.exists(input_file):
-        print(f"Input file does not exist: {input_file}")
-        return False
-    
-    try:
-        ser = serial.Serial(port, BaudRate, timeout=10, dsrdtr=False,  
-                          write_timeout=10, xonxoff=False, rtscts=False)
-        
-        # ... (前面的握手过程与原来相同)
-        
-        # 在发送操作后，添加密钥和IV发送
-        # 发送密钥
-        print("Sending key...")
-        ser.write(key)
-        ser.flush()
-        
-        # 等待密钥确认
-        print("Waiting for key ACK...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'ACK' in line:
-                    print("Key accepted")
-                    break
-        
-        # 发送IV
-        print("Sending IV...")
-        ser.write(iv)
-        ser.flush()
-        
-        # 等待IV确认
-        print("Waiting for IV ACK...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'ACK' in line:
-                    print("IV accepted")
-                    break
-        
-        # ... (后续的文件处理流程与原来相同)
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        if 'ser' in locals():
-            ser.close()
-        return False
-
-def auto_mode_continuous(port):
-    """连续自动模式：加密 -> 解密 -> 对比"""
-    print("=== Starting Continuous Auto Mode: Encrypt -> Decrypt -> Compare ===")
-    
-    try:
-        ser = serial.Serial(port, BaudRate, timeout=10, dsrdtr=False,  
-                          write_timeout=10, xonxoff=False, rtscts=False)
-        
-        # 等待MCU启动完成
-        print("Waiting for MCU to be ready...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if 'READY' in line:
-                    print("MCU is ready")
-                    break
-        
-        # 步骤1: 加密
-        print("\n--- Step 1: Encrypting input.txt -> ciphertext.txt ---")
-        if process_operation_continuous(ser, "encrypt"):
-            print("✓ Encryption completed successfully")
+    def disconnect(self):
+        """断开连接"""
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+            if self.verbose:
+                print("Disconnected")
             
-            # 步骤2: 解密
-            print("\n--- Step 2: Decrypting ciphertext.txt -> output.txt ---")
-            if process_operation_continuous(ser, "decrypt"):
-                print("✓ Decryption completed successfully")
-                
-                # 步骤3: 文件对比
-                print("\n--- Step 3: Comparing input.txt and output.txt ---")
-                verify_files("input.txt", "output.txt")
+    def read_mcu_output(self, timeout=10):
+        """读取MCU输出并显示"""
+        start_time = time.time()
+        output_lines = []
+        while time.time() - start_time < timeout:
+            if self.ser.in_waiting > 0:
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    if self.verbose:
+                        print(f"MCU: {line}")
+                    output_lines.append(line)
             else:
-                print("✗ Decryption failed, skipping file comparison")
+                time.sleep(0.01)
+        return output_lines
+        
+    def wait_for_message(self, expected_msg, timeout=10):
+        """等待特定消息 - 增强版本"""
+        if self.verbose:
+            print(f"Waiting for: {expected_msg}")
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self.ser.in_waiting > 0:
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if self.verbose:
+                    print(f"MCU: {line}")
+                if expected_msg in line:
+                    return line
+                if 'ERROR' in line:
+                    print(f"MCU error: {line}")
+                    return None
+                if 'STREAM_COMPLETE' in line:
+                    if self.verbose:
+                        print("✓ Stream completed while waiting for other message")
+                    return 'STREAM_COMPLETE'
+                if 'END_OF_STREAM_RECEIVED' in line:
+                    if self.verbose:
+                        print("✓ End of stream received")
+                    return 'END_OF_STREAM_RECEIVED'
+            time.sleep(0.01)
+        if self.verbose:
+            print(f"Timeout waiting for: {expected_msg}")
+        return None
+        
+    def send_and_wait(self, data, expected_response, timeout=10):
+        """发送数据并等待响应"""
+        if isinstance(data, str):
+            data = data.encode()
+        if self.verbose:
+            print(f"Sending: {data[:min(50, len(data))]}{'...' if len(data) > 50 else ''}")
+        self.ser.write(data)
+        self.ser.flush()
+        return self.wait_for_message(expected_response, timeout)
+        
+    def safe_base64_decode(self, b64_data):
+        """安全的Base64解码"""
+        try:
+            # 移除所有可能的无效字符
+            import re
+            b64_data = re.sub(r'[^A-Za-z0-9+/=]', '', b64_data)
+            
+            # 确保长度是4的倍数
+            padding_needed = (4 - len(b64_data) % 4) % 4
+            b64_data += '=' * padding_needed
+            
+            # 验证Base64字符串格式
+            if len(b64_data) < 4 or len(b64_data) % 4 != 0:
+                if self.verbose:
+                    print(f"Invalid Base64 length: {len(b64_data)}")
+                return None
+                
+            # 尝试解码
+            decoded = base64.b64decode(b64_data)
+            return decoded
+        except Exception as e:
+            if self.verbose:
+                print(f"Base64 decode error: {e}")
+                print(f"Problematic data length: {len(b64_data)}")
+            return None
+    
+    def send_streaming_chunk(self, chunk_data, is_last=False):
+        """在流式模式下发送一个数据块（简化版）"""
+        if not self.ser or not self.ser.is_open:
+            print("Serial port not connected")
+            return False
+            
+        # 发送块头（4字节长度，大端序）
+        if is_last:
+            # 发送结束标记
+            chunk_header = struct.pack('>I', 0)
+            if self.verbose:
+                print("Sending end-of-stream marker (0-length chunk)")
+            self.ser.write(chunk_header)
+            self.ser.flush()
+            return True
         else:
-            print("✗ Encryption failed, skipping decryption and comparison")
+            chunk_header = struct.pack('>I', len(chunk_data))
+            if self.verbose:
+                print(f"Sending chunk header: {len(chunk_data)} bytes")
+            self.ser.write(chunk_header)
+            self.ser.flush()
+            
+            # 等待MCU的WAIT_STREAM_CHUNK响应
+            wait_msg = self.wait_for_message('WAIT_STREAM_CHUNK', 10)
+            if not wait_msg:
+                if self.verbose:
+                    print("Did not receive WAIT_STREAM_CHUNK")
+                return False
+                
+            # 发送实际数据
+            if self.verbose:
+                print(f"Sending chunk data: {len(chunk_data)} bytes")
+            self.ser.write(chunk_data)
+            self.ser.flush()
+            return True
+    
+    def encrypt_file(self, input_file, output_file, custom_key=None, custom_nonce=None, custom_aad=b""):
+        """加密文件（仅支持流式模式）"""
+        if not self.connect():
+            return False
+            
+        try:
+            # 读取输入文件
+            with open(input_file, 'rb') as f:
+                file_data = f.read()
+                
+            print(f"File size: {len(file_data)} bytes")
+            
+            # 初始化进度变量
+            self.total_size = len(file_data)
+            self.total_processed = 0
+            self.current_chunk = 0
+            self.total_chunks = (len(file_data) + CHUNK_SIZE - 1) // CHUNK_SIZE
+            
+            # 确定密钥
+            if custom_key is None:
+                key = bytes([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
+                print(f"使用默认密钥: {key.hex().upper()}")
+            else:
+                key = custom_key
+                print(f"使用自定义密钥: {key.hex().upper()}")
+            
+            # 确定Nonce
+            if custom_nonce is None:
+                nonce = secrets.token_bytes(16)
+                print(f"使用随机Nonce: {nonce.hex().upper()}")
+            else:
+                nonce = custom_nonce
+                print(f"使用自定义Nonce: {nonce.hex().upper()}")
+            
+            # 确定AAD
+            aad = custom_aad
+            if len(aad) > 0:
+                print(f"使用AAD: {aad.hex().upper()} (长度: {len(aad)}字节)")
+            else:
+                print("未使用AAD")
+            
+            print(f"Starting encryption process (streaming mode)...")
+            
+            # 等待MCU准备
+            if not self.wait_for_message('READY', 15):
+                print("MCU not ready")
+                return False
+                
+            # 进入流模式
+            if not self.send_and_wait(b'n', 'NEW_STREAM_MODE'):
+                return False
+                
+            # 等待操作选择
+            if not self.wait_for_message('WAIT_OPERATION'):
+                return False
+                
+            # 发送加密操作
+            if not self.send_and_wait(b'e', 'ACK'):
+                return False
+                
+            # 等待密钥请求
+            if not self.wait_for_message('WAIT_KEY'):
+                return False
+                
+            # 发送密钥
+            if not self.send_and_wait(key, 'ACK'):
+                return False
+                
+            # 等待Nonce请求  
+            if not self.wait_for_message('WAIT_NONCE'):
+                return False
+                
+            # 发送Nonce
+            if not self.send_and_wait(nonce, 'ACK'):
+                return False
+                
+            # 发送AAD长度
+            print("WAIT_AAD_LEN")
+            aad_len = len(aad)
+            aad_len_data = struct.pack('>I', aad_len)
+            if not self.send_and_wait(aad_len_data, 'ACK'):
+                print("注意: MCU可能不支持AAD，继续处理...")
+                # 即使不支持AAD也继续，MCU会忽略AAD
+                
+            # 发送AAD数据（如果有）
+            if aad_len > 0:
+                print("WAIT_AAD_DATA")
+                if not self.send_and_wait(aad, 'ACK'):
+                    print("注意: AAD发送失败，继续处理...")
+                
+            print("✓ Entered streaming mode")
+            
+            # 流式模式发送数据
+            return self._encrypt_streaming(file_data, nonce, output_file)
+                
+        except Exception as e:
+            print(f"Encryption error: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        finally:
+            self.disconnect()
+    
+    def _encrypt_streaming(self, file_data, nonce, output_file):
+        """流式模式加密 - 复用传统模式通信逻辑"""
+        total_sent = 0
+        chunk_count = 0
+        encrypted_data = b''
         
-        ser.close()
-        print("\n=== Continuous Auto Mode Completed ===")
-        return True
+        # 关键：在开始前给MCU一些预热时间（与传统模式相同）
+        if self.verbose:
+            print("Allowing MCU hardware warmup...")
+        time.sleep(0.3)  # 300ms预热时间，与传统模式的自然延迟相当
         
-    except Exception as e:
-        print(f"Error in continuous auto mode: {e}")
-        if 'ser' in locals():
-            ser.close()
-        return False
-
-def process_operation_continuous(ser, operation):
-    """在已建立的连接上处理操作（支持密钥和IV）"""
-    
-    input_file = "input.txt" if operation == "encrypt" else "ciphertext.txt"
-    output_file = "ciphertext.txt" if operation == "encrypt" else "output.txt"
-    
-    # 默认密钥和IV
-    default_key = bytes([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
-    default_iv = bytes([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
-    
-    # 选择新的流式处理模式
-    print("Selecting new stream mode...")
-    ser.write(b'n')
-    ser.flush()
-    
-    # 等待MCU进入新模式
-    print("Waiting for MCU to enter new stream mode...")
-    start_time = time.time()
-    while time.time() - start_time < 10:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if 'NEW_STREAM_MODE' in line:
-                print("MCU entered new stream mode")
-                break
-            if 'ERROR' in line:
-                print(f"MCU error: {line}")
-                return False
-    
-    # 等待操作选择提示
-    print("Waiting for operation prompt...")
-    start_time = time.time()
-    while time.time() - start_time < 10:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if 'WAIT_OPERATION' in line:
-                print("Sending operation...")
-                break
-    
-    # 发送操作模式
-    if operation == "encrypt":
-        ser.write(b'e')
-    else:
-        ser.write(b'd')
-    ser.flush()
-    print(f"Sent operation: {operation}")
-    
-    # 等待确认
-    print("Waiting for ACK...")
-    start_time = time.time()
-    while time.time() - start_time < 10:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if 'ACK' in line:
-                print("Operation accepted")
-                break
-            if 'ERROR' in line:
-                print(f"Operation error: {line}")
-                return False
-    
-    # 发送默认密钥
-    print("Sending default key...")
-    ser.write(default_key)
-    ser.flush()
-    
-    # 等待密钥确认
-    print("Waiting for key ACK...")
-    start_time = time.time()
-    while time.time() - start_time < 10:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if 'ACK' in line:
-                print("Key accepted")
-                break
-    
-    # 发送默认IV
-    print("Sending default IV...")
-    ser.write(default_iv)
-    ser.flush()
-    
-    # 等待IV确认
-    print("Waiting for IV ACK...")
-    start_time = time.time()
-    while time.time() - start_time < 10:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if 'ACK' in line:
-                print("IV accepted")
-                break
-    
-    # 读取输入文件
-    with open(input_file, 'rb') as f:
-        file_data = f.read()
-    
-    file_size = len(file_data)
-    print(f"Processing file: {input_file} ({file_size} bytes)")
-    
-    # 等待文件大小提示
-    print("Waiting for file size prompt...")
-    start_time = time.time()
-    size_prompt_received = False
-    while time.time() - start_time < 15:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if 'WAIT_SIZE' in line:
-                print("Sending file size...")
-                size_prompt_received = True
-                break
-            if 'ERROR' in line:
-                print(f"MCU error before size: {line}")
-                return False
-
-    if not size_prompt_received:
-        print("File size prompt timeout")
-        return False
-
-    # 发送文件大小前短暂延迟
-    time.sleep(0.1)
-
-    # 发送文件大小 (4字节大端序)
-    size_data = struct.pack('>I', file_size)
-    print(f"Sending file size: {file_size} bytes")
-
-    # 逐字节发送文件大小
-    for i in range(4):
-        ser.write(size_data[i:i+1])
-        ser.flush()
-        time.sleep(0.01)
-
-    print("File size sent completely")
-    
-    # 等待文件大小确认
-    print("Waiting for file size ACK...")
-    start_time = time.time()
-    while time.time() - start_time < 10:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if 'ACK' in line:
-                print("File size accepted")
-                break
-            if 'ERROR' in line:
-                print(f"File size error: {line}")
-                return False
-    
-    # 等待数据就绪
-    print("Waiting for MCU to be ready for data...")
-    start_time = time.time()
-    while time.time() - start_time < 10:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if 'READY_FOR_DATA' in line:
-                print("MCU is ready for data")
-                break
-    
-    # 分块发送数据 - 关键修改：解密时使用加密后的实际块大小
-    total_sent = 0
-    chunk_count = 0
-    
-    with open(output_file, 'wb') as out_f:
-        while total_sent < file_size:
+        # 复用传统模式的通信循环
+        while total_sent < len(file_data):
             chunk_count += 1
-            remaining = file_size - total_sent
+            self.current_chunk = chunk_count
             
-            # 等待块请求并获取请求的块大小
-            print(f"Waiting for chunk request {chunk_count}...")
+            # 等待MCU的WAIT_CHUNK消息（与传统模式完全相同）
+            chunk_line = None
             start_time = time.time()
-            chunk_request_received = False
-            requested_size = 0
-            while time.time() - start_time < 10:
-                if ser.in_waiting > 0:
-                    line = ser.readline().decode('utf-8', errors='ignore').strip()
-                    if 'WAIT_CHUNK' in line:
-                        # 提取请求的块大小
-                        try:
-                            requested_size = int(line.split(':')[1])
-                            print(f"MCU requested chunk of {requested_size} bytes")
-                            
-                            # 验证请求的大小是否合理
-                            if requested_size > remaining:
-                                requested_size = remaining
-                            
-                            chunk_request_received = True
-                            break
-                        except (ValueError, IndexError):
-                            # 使用默认块大小
-                            requested_size = min(remaining, 128)
-                            chunk_request_received = True
-                            break
+            while time.time() - start_time < 30 and chunk_line is None:
+                if self.ser.in_waiting > 0:
+                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    if self.verbose:
+                        print(f"MCU: {line}")
+                    
+                    if line.startswith('WAIT_CHUNK'):
+                        chunk_line = line
+                    elif 'ERROR' in line:
+                        print(f"MCU error: {line}")
+                        return False
+                    elif 'STREAM_COMPLETE' in line:
+                        if self.verbose:
+                            print("✓ Stream completed unexpectedly")
+                        return True
+                time.sleep(0.01)
             
-            if not chunk_request_received:
-                print("Chunk request timeout")
-                break
+            if chunk_line is None:
+                print("No chunk request received")
+                return False
             
-            # 准备数据块
-            current_chunk_size = requested_size
+            # 解析请求的块大小
+            try:
+                requested_size = int(chunk_line.split(':')[1])
+            except:
+                requested_size = CHUNK_SIZE
+            
+            # 计算要发送的实际块大小
+            remaining = len(file_data) - total_sent
+            current_chunk_size = min(requested_size, remaining)
+            
+            # 发送块头（4字节长度信息）
+            chunk_header = struct.pack('>I', current_chunk_size)
+            if self.verbose:
+                print(f"Sending chunk header: {current_chunk_size} bytes")
+            self.ser.write(chunk_header)
+            self.ser.flush()
+            
+            # 发送数据块
             chunk = file_data[total_sent:total_sent + current_chunk_size]
-            
-            print(f"Sending chunk {chunk_count}: {len(chunk)} bytes")
-            
-            # 批量发送，提高效率
-            bytes_sent = 0
-            block_size = 64  # 每次发送64字节
-            while bytes_sent < len(chunk):
-                end_pos = min(bytes_sent + block_size, len(chunk))
-                block = chunk[bytes_sent:end_pos]
-                ser.write(block)
-                ser.flush()
-                bytes_sent += len(block)
-                time.sleep(0.02)  # 每块之间短暂延迟
-            
+            if self.verbose:
+                print(f"Sending chunk {chunk_count}: {len(chunk)} bytes")
+            self.ser.write(chunk)
+            self.ser.flush()
             total_sent += len(chunk)
             
-            # 等待块接收确认
-            print("Waiting for chunk reception...")
+            # 等待块接收确认（与传统模式相同）
+            if not self.wait_for_message('CHUNK_RECEIVED', 30):
+                print("Chunk not acknowledged")
+                return False
+            
+            # 处理响应（与传统模式相同）
+            chunk_success = False
             start_time = time.time()
-            chunk_received = False
+            received_b64_data = None
             
-            while time.time() - start_time < 60:
-                if ser.in_waiting > 0:
-                    line = ser.readline().decode('utf-8', errors='ignore').strip()
+            while time.time() - start_time < 60 and not chunk_success:
+                if self.ser.in_waiting > 0:
+                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    if self.verbose:
+                        print(f"MCU: {line}")
                     
-                    if 'CHUNK_RECEIVED' in line:
-                        try:
-                            received_size = int(line.split(':')[1])
-                            if received_size == len(chunk):
-                                chunk_received = True
-                                print("✓ Chunk received by MCU")
-                            else:
-                                print(f"Size mismatch: sent {len(chunk)}, MCU received {received_size}")
-                        except (ValueError, IndexError):
-                            print(f"Failed to parse CHUNK_RECEIVED: {line}")
-                        break
-                    if 'PROGRESS' in line:
-                        print(f"MCU progress: {line}")
-                    if 'ERROR' in line:
-                        print(f"MCU error: {line}")
-                        break
-            
-            if not chunk_received:
-                print("⚠ Chunk reception timeout")
-            
-            # 等待处理结果
-            print("Waiting for processed data...")
-            start_time = time.time()
-            processed_data = None
-            b64_data = ""
-            base64_received = False
-            expected_b64_len = None  # 初始化为None
-
-            while time.time() - start_time < 60:
-                if ser.in_waiting > 0:
-                    line = ser.readline().decode('utf-8', errors='ignore').strip()
-                    
-                    # 检查Base64长度信息（Ascon项目特有）
-                    if line.startswith('B64_LEN:'):
-                        expected_b64_len = int(line.split(':')[1])
-                        print(f"Expected Base64 length: {expected_b64_len}")
-                        continue
-
-                    # 检查是否是Base64数据行（通用）
                     if line.startswith('B64:'):
-                        b64_data = line[4:]  # 移除"B64:"前缀
-                        actual_b64_len = len(b64_data)
-                        print(f"✓ Received Base64 data, length: {actual_b64_len}")
-                        
-                        # 通用处理：不依赖B64_LEN，直接尝试解码
-                        base64_received = True
-                        
-                        # 立即尝试解码
-                        try:
-                            # 确保Base64字符串长度是4的倍数
-                            padding_needed = len(b64_data) % 4
-                            if padding_needed:
-                                b64_data += '=' * (4 - padding_needed)
-                            
-                            processed_data = base64.b64decode(b64_data)
-                            print(f"✓ Successfully decoded Base64: {len(processed_data)} bytes")
-                            break
-                        except Exception as e:
-                            print(f"✗ Base64 decode error: {e}")
-                            print(f"  Problematic Base64 data: {b64_data[:100]}...")
-                            continue
+                        b64_data = line[4:]
+                        if len(b64_data) > 10:
+                            decoded = self.safe_base64_decode(b64_data)
+                            if decoded:
+                                received_b64_data = decoded
+                                encrypted_data += decoded
+                                self.total_processed += len(decoded)
+                                if self.verbose:
+                                    print(f"✓ Received encrypted chunk {chunk_count}: {len(decoded)} bytes")
+                                else:
+                                    # 非详细模式下只显示简略信息
+                                    print(f"✓ Chunk {chunk_count}: {len(decoded)} bytes")
+                            else:
+                                if self.verbose:
+                                    print(f"Base64 decode failed for chunk {chunk_count}")
                     
-                    if 'CHUNK_PROCESSED' in line:
-                        print("✓ Chunk processing completed")
-                        # 如果已经收到Base64数据但还没解码成功，再次尝试
-                        if base64_received and not processed_data:
-                            try:
-                                padding_needed = len(b64_data) % 4
-                                if padding_needed:
-                                    b64_data += '=' * (4 - padding_needed)
-                                processed_data = base64.b64decode(b64_data)
-                                print(f"✓ Decoded Base64 after CHUNK_PROCESSED: {len(processed_data)} bytes")
-                                break
-                            except Exception as e:
-                                print(f"✗ Base64 decode error after CHUNK_PROCESSED: {e}")
+                    elif 'CHUNK_PROCESSED' in line:
+                        if received_b64_data is not None:
+                            if self.verbose:
+                                print(f"✓ Chunk {chunk_count} processed successfully")
+                            chunk_success = True
+                        else:
+                            if self.verbose:
+                                print(f"Warning: Chunk {chunk_count} processed but no data received")
+                            chunk_success = True
                     
-                    if 'PROGRESS' in line:
-                        print(f"Progress: {line}")
+                    elif 'STREAM_STATS' in line:
+                        if self.verbose:
+                            print(f"MCU Stream Stats: {line}")
+                        # 不打断处理流程，继续等待CHUNK_PROCESSED
                     
-                    if 'ERROR' in line:
+                    elif 'ERROR' in line:
                         print(f"MCU error: {line}")
-                        break
+                        return False
                     
-                    if 'STREAM_COMPLETE' in line:
-                        print("Stream completed")
-                        break
+                    elif 'STREAM_COMPLETE' in line:
+                        if self.verbose:
+                            print("✓ Stream completed during chunk processing")
+                        return True
+                else:
+                    time.sleep(0.01)
             
-            if processed_data:
-                out_f.write(processed_data)
-                out_f.flush()
-                print(f"✓ Written {len(processed_data)} bytes to output file")
-            else:
-                print("✗ No processed data received")
+            if not chunk_success:
+                if self.verbose:
+                    print(f"Chunk {chunk_count} processing timeout")
+                # 即使超时也继续尝试，只要收到了数据
+                if received_b64_data is not None:
+                    if self.verbose:
+                        print(f"Continuing despite timeout (data received)")
+                    chunk_success = True
+                else:
+                    return False
             
-            progress = (total_sent / file_size) * 100
-            print(f"Overall progress: {progress:.1f}%")
-            
-            if total_sent >= file_size:
-                break
-    
-    # 等待流处理完成
-    print("Waiting for stream completion...")
-    start_time = time.time()
-    while time.time() - start_time < 30:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if 'STREAM_COMPLETE' in line:
-                print("✓ Stream processing completed")
-                break
-            if 'SUMMARY' in line or 'SUCCESS' in line or 'WARNING' in line:
-                print(f"MCU: {line}")
-    
-    print(f"Processing completed. Output: {output_file}")
-    
-    # 验证输出文件
-    if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-        output_size = os.path.getsize(output_file)
-        print(f"✓ {operation.capitalize()} successful: {output_file} created with {output_size} bytes")
-        return True
-    else:
-        print(f"✗ {operation.capitalize()} failed: {output_file} is empty or missing")
-        return False
+            if self.show_progress:
+                print(f"Stream progress: {total_sent}/{len(file_data)} bytes ({total_sent/len(file_data)*100:.1f}%)")
+        
+        # 所有数据发送完毕，发送结束标记
+        if self.verbose:
+            print("Sending end-of-stream marker (0-length chunk)")
+        end_header = struct.pack('>I', 0)
+        self.ser.write(end_header)
+        self.ser.flush()
+        
+        # 等待流结束确认
+        end_msg = self.wait_for_message('END_OF_STREAM', 30)
+        if not end_msg and self.verbose:
+            print("Did not receive END_OF_STREAM confirmation")
+        
+        # 等待流完成
+        stream_msg = self.wait_for_message('STREAM_COMPLETE', 30)
+        if not stream_msg and self.verbose:
+            print("Stream completion not received")
+        
+        # 保存加密结果
+        if encrypted_data:
+            with open(output_file, 'wb') as f:
+                f.write(nonce)
+                f.write(encrypted_data)
+                
+            print(f"✓ Streaming encryption successful: {output_file}")
+            if self.verbose:
+                print(f"  Nonce: {nonce.hex()}")
+                print(f"  Total encrypted data: {len(encrypted_data)} bytes")
+                print(f"  Original file size: {len(file_data)} bytes")
+                print(f"  Chunks processed: {chunk_count}")
+            return True
+        else:
+            print("✗ Streaming encryption failed: no encrypted data received")
+            return False
 
-def verify_files(file1=None, file2=None):
+    def _decrypt_streaming(self, encrypted_data, nonce, output_file, key, aad=b""):
+        """流式模式解密 - 修复版本，正确发送加密块大小"""
+        total_sent = 0
+        chunk_count = 0
+        decrypted_data = b''
+        
+        # 关键：在开始前给MCU一些预热时间
+        if self.verbose:
+            print("Allowing MCU hardware warmup...")
+        time.sleep(0.3)
+        
+        # 计算加密块大小（与GCM-SIV加密格式匹配）
+        # 重要：每个加密块 = 明文块大小 + 16字节标签
+        total_encrypted_size = len(encrypted_data)
+        remaining = total_encrypted_size
+        
+        if self.verbose:
+            print(f"Total encrypted data: {total_encrypted_size} bytes")
+            print(f"Expected chunk size for decryption: {CHUNK_SIZE + 16} bytes (plaintext + tag)")
+        
+        while remaining > 0:
+            chunk_count += 1
+            self.current_chunk = chunk_count
+            
+            # 等待MCU的WAIT_CHUNK消息
+            chunk_line = None
+            start_time = time.time()
+            while time.time() - start_time < 30 and chunk_line is None:
+                if self.ser.in_waiting > 0:
+                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    if self.verbose:
+                        print(f"MCU: {line}")
+                    
+                    if line.startswith('WAIT_CHUNK'):
+                        chunk_line = line
+                        # 解析MCU请求的块大小
+                        try:
+                            requested_size = int(line.split(':')[1])
+                            if self.verbose:
+                                print(f"MCU requested chunk size: {requested_size} bytes")
+                        except:
+                            requested_size = CHUNK_SIZE + 16  # 默认加密块大小
+                    elif 'ERROR' in line:
+                        print(f"MCU error: {line}")
+                        return False
+                    elif 'STREAM_COMPLETE' in line:
+                        if self.verbose:
+                            print("✓ Stream completed unexpectedly")
+                        return True
+                time.sleep(0.01)
+            
+            if chunk_line is None:
+                print("No chunk request received")
+                return False
+            
+            # 计算要发送的加密块大小
+            # 对于解密模式，每个加密块应该是 (CHUNK_SIZE + 16) 字节
+            # 最后一个块可能小于这个值
+            expected_chunk_size = CHUNK_SIZE + 16
+            chunk_size = min(expected_chunk_size, remaining)
+            
+            # 检查MCU请求的大小是否与我们的预期匹配
+            try:
+                requested_size = int(chunk_line.split(':')[1])
+                if requested_size != expected_chunk_size and requested_size != chunk_size:
+                    if self.verbose:
+                        print(f"Warning: MCU requested {requested_size} bytes, but we expected {expected_chunk_size}")
+                    # 使用MCU请求的大小，但不能超过剩余数据
+                    chunk_size = min(requested_size, remaining)
+            except:
+                pass  # 使用我们计算的chunk_size
+            
+            # 发送块头（4字节长度信息）
+            chunk_header = struct.pack('>I', chunk_size)
+            if self.verbose:
+                print(f"Sending encrypted chunk header: {chunk_size} bytes")
+            self.ser.write(chunk_header)
+            self.ser.flush()
+            
+            # 发送加密数据块
+            chunk = encrypted_data[total_sent:total_sent + chunk_size]
+            if self.verbose:
+                print(f"Sending encrypted chunk {chunk_count}: {len(chunk)} bytes")
+            self.ser.write(chunk)
+            self.ser.flush()
+            total_sent += len(chunk)
+            remaining -= len(chunk)
+            
+            # 等待块接收确认
+            ack_msg = self.wait_for_message('CHUNK_RECEIVED', 30)
+            if not ack_msg:
+                print("Chunk not acknowledged")
+                return False
+            
+            # 处理响应
+            chunk_success = False
+            start_time = time.time()
+            received_b64_data = None
+            
+            while time.time() - start_time < 30 and not chunk_success:  # 缩短超时时间
+                if self.ser.in_waiting > 0:
+                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    if self.verbose:
+                        print(f"MCU: {line}")
+                    
+                    if line.startswith('B64:'):
+                        b64_data = line[4:]
+                        decoded = self.safe_base64_decode(b64_data)
+                        if decoded:
+                            received_b64_data = decoded
+                            decrypted_data += decoded
+                            self.total_processed += len(decoded)
+                            if self.verbose:
+                                print(f"✓ Received decrypted chunk {chunk_count}: {len(decoded)} bytes")
+                            else:
+                                # 非详细模式下只显示简略信息
+                                print(f"✓ Chunk {chunk_count}: {len(decoded)} bytes")
+                        else:
+                            if self.verbose:
+                                print(f"Base64 decode failed for chunk {chunk_count}")
+                    
+                    elif 'CHUNK_PROCESSED' in line:
+                        if received_b64_data is not None:
+                            if self.verbose:
+                                print(f"✓ Chunk {chunk_count} processed successfully")
+                            chunk_success = True
+                        else:
+                            if self.verbose:
+                                print(f"Warning: Chunk {chunk_count} processed but no data received")
+                            chunk_success = True
+                    
+                    elif 'STREAM_STATS' in line:
+                        if self.verbose:
+                            print(f"MCU Stream Stats: {line}")
+                        # 不打断处理流程，继续等待CHUNK_PROCESSED
+                    
+                    elif 'ERROR' in line:
+                        print(f"MCU error: {line}")
+                        return False
+                    
+                    elif 'STREAM_COMPLETE' in line:
+                        if self.verbose:
+                            print("✓ Stream completed during chunk processing")
+                        return True
+                else:
+                    time.sleep(0.01)
+            
+            if not chunk_success:
+                # 即使没有收到CHUNK_PROCESSED，如果收到了数据就继续
+                if received_b64_data is not None:
+                    if self.verbose:
+                        print(f"⚠ Chunk {chunk_count} completed without confirmation (data received)")
+                    chunk_success = True
+                else:
+                    print(f"✗ Chunk {chunk_count} failed: no data received")
+                    return False
+            
+            if self.show_progress:
+                print(f"Stream progress: {total_sent}/{total_encrypted_size} bytes ({total_sent/total_encrypted_size*100:.1f}%)")
+        
+        # 所有数据发送完毕，发送结束标记
+        if self.verbose:
+            print("Sending end-of-stream marker (0-length chunk)")
+        end_header = struct.pack('>I', 0)
+        self.ser.write(end_header)
+        self.ser.flush()
+        
+        # 等待流结束确认
+        end_msg = self.wait_for_message('END_OF_STREAM', 30)
+        if not end_msg and self.verbose:
+            print("Did not receive END_OF_STREAM confirmation")
+        
+        # 等待流完成
+        stream_msg = self.wait_for_message('STREAM_COMPLETE', 30)
+        if not stream_msg and self.verbose:
+            print("Stream completion not received")
+        
+        # 保存解密结果
+        if decrypted_data:
+            with open(output_file, 'wb') as f:
+                f.write(decrypted_data)
+                
+            print(f"✓ Streaming decryption successful: {output_file}")
+            if self.verbose:
+                print(f"  Plaintext: {len(decrypted_data)} bytes")
+                print(f"  Total encrypted data processed: {total_sent}/{total_encrypted_size} bytes")
+                print(f"  Chunks processed: {chunk_count}")
+                
+                # 验证解密结果
+                expected_plaintext_size = total_encrypted_size - (chunk_count * 16)
+                if len(decrypted_data) == expected_plaintext_size:
+                    print(f"  ✓ Decrypted size matches expected: {len(decrypted_data)} bytes")
+                else:
+                    print(f"  ⚠ Decrypted size mismatch: expected {expected_plaintext_size}, got {len(decrypted_data)}")
+            
+            return True
+        else:
+            print("✗ Streaming decryption failed: no decrypted data received")
+            return False
+        
+    def decrypt_file(self, input_file, output_file, custom_key=None, custom_aad=b""):
+        """解密文件（仅支持流式模式）"""
+        if not self.connect():
+            return False
+            
+        try:
+            # 读取加密文件（格式: nonce + 所有加密块）
+            with open(input_file, 'rb') as f:
+                nonce = f.read(16)  # 基础Nonce
+                encrypted_data = f.read()  # 所有加密块
+                
+            print(f"Encrypted file: {len(encrypted_data)} bytes encrypted data")
+            if self.verbose:
+                print(f"Nonce from file: {nonce.hex().upper()}")
+            
+            # 确定密钥
+            if custom_key is None:
+                key = bytes([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
+                print(f"使用默认密钥: {key.hex().upper()}")
+            else:
+                key = custom_key
+                print(f"使用自定义密钥: {key.hex().upper()}")
+            
+            # 确定AAD
+            aad = custom_aad
+            if len(aad) > 0:
+                print(f"使用AAD: {aad.hex().upper()} (长度: {len(aad)}字节)")
+            else:
+                print("未使用AAD")
+            
+            # 初始化进度变量
+            self.total_size = len(encrypted_data)
+            self.total_processed = 0
+            self.current_chunk = 0
+            
+            # 验证文件完整性
+            if len(encrypted_data) == 0:
+                print("Error: Encrypted data is empty")
+                return False
+                
+            print(f"Starting decryption process (streaming mode)...")
+            
+            # 等待MCU准备
+            if not self.wait_for_message('READY', 15):
+                print("MCU not ready")
+                return False
+                
+            # 进入流模式
+            if not self.send_and_wait(b'n', 'NEW_STREAM_MODE'):
+                return False
+                
+            # 等待操作选择
+            if not self.wait_for_message('WAIT_OPERATION'):
+                return False
+                
+            # 发送解密操作
+            if not self.send_and_wait(b'd', 'ACK'):
+                return False
+                
+            # 等待密钥请求
+            if not self.wait_for_message('WAIT_KEY'):
+                return False
+                
+            # 发送密钥
+            if not self.send_and_wait(key, 'ACK'):
+                return False
+                
+            # 等待Nonce请求  
+            if not self.wait_for_message('WAIT_NONCE'):
+                return False
+                
+            # 发送Nonce
+            if not self.send_and_wait(nonce, 'ACK'):
+                return False
+                
+            # 发送AAD长度
+            print("WAIT_AAD_LEN")
+            aad_len = len(aad)
+            aad_len_data = struct.pack('>I', aad_len)
+            if not self.send_and_wait(aad_len_data, 'ACK'):
+                print("注意: MCU可能不支持AAD，继续处理...")
+                # 即使不支持AAD也继续，MCU会忽略AAD
+                
+            # 发送AAD数据（如果有）
+            if aad_len > 0:
+                print("WAIT_AAD_DATA")
+                if not self.send_and_wait(aad, 'ACK'):
+                    print("注意: AAD发送失败，继续处理...")
+                
+            print("✓ Entered streaming mode")
+            
+            # 流式模式发送数据
+            return self._decrypt_streaming(encrypted_data, nonce, output_file, key, aad)
+                
+        except Exception as e:
+            print(f"Decryption error: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        finally:
+            self.disconnect()
+    
+    def verify_encrypted_file(self, input_file):
+        """验证加密文件的完整性"""
+        try:
+            with open(input_file, 'rb') as f:
+                nonce = f.read(16)
+                encrypted_data = f.read()
+                
+            print(f"Encrypted file verification:")
+            print(f"  Nonce: {len(nonce)} bytes")
+            print(f"  Encrypted data: {len(encrypted_data)} bytes")
+            
+            # 检查基本完整性
+            if len(nonce) != 16:
+                print("  ✗ Invalid nonce size")
+                return False
+                
+            if len(encrypted_data) == 0:
+                print("  ✗ No encrypted data")
+                return False
+                
+            print("  ✓ File structure appears valid")
+            return True
+            
+        except Exception as e:
+            print(f"  ✗ Verification error: {e}")
+            return False
+
+def verify_files(file1, file2):
     """验证两个文件是否相同"""
-    # 设置默认文件路径
-    file1_default = "input.txt"
-    file2_default = "output.txt"
-    
-    # 如果提供了文件参数，直接使用（用于自动模式）
-    if file1 is not None and file2 is not None:
-        # 直接比较模式，不等待用户输入
-        print(f"Comparing files: {file1} vs {file2}")
-    else:
-        # 交互模式，提示用户输入
-        if file1 is None:
-            user_input = input(f"Enter first file path [{file1_default}]: ").strip()
-            file1 = user_input if user_input else file1_default
-        
-        if file2 is None:
-            user_input = input(f"Enter second file path [{file2_default}]: ").strip()
-            file2 = user_input if user_input else file2_default
-    
-    if not os.path.exists(file1):
-        print(f"File does not exist: {file1}")
-        return False
-    if not os.path.exists(file2):
-        print(f"File does not exist: {file2}")
-        return False
-        
     try:
         with open(file1, 'rb') as f1, open(file2, 'rb') as f2:
             content1 = f1.read()
@@ -782,64 +856,118 @@ def verify_files(file1=None, file2=None):
                 print(f"  {file1}: {len(content1)} bytes")
                 print(f"  {file2}: {len(content2)} bytes")
                 
-                # 找出差异位置
+                # 找出差异
                 min_len = min(len(content1), len(content2))
                 differences = 0
-                first_diff = -1
                 for i in range(min_len):
                     if content1[i] != content2[i]:
                         differences += 1
-                        if first_diff == -1:
-                            first_diff = i
+                        if differences == 1:
+                            print(f"  First difference at byte {i}: 0x{content1[i]:02x} vs 0x{content2[i]:02x}")
                 
                 if differences > 0:
-                    print(f"  Found {differences} differences")
-                    print(f"  First difference at byte position: {first_diff}")
-                    if first_diff >= 0:
-                        print(f"  {file1} byte {first_diff}: 0x{content1[first_diff]:02x}")
-                        print(f"  {file2} byte {first_diff}: 0x{content2[first_diff]:02x}")
-                
-                if len(content1) != len(content2):
-                    print(f"  File size difference: {abs(len(content1) - len(content2))} bytes")
-                
+                    print(f"  Total differences: {differences}")
+                    
                 return False
     except Exception as e:
-        print(f"Error verifying files: {e}")
+        print(f"Error comparing files: {e}")
         return False
 
-def legacy_modes(port):
-    """原有的legacy模式"""
-    print("Legacy modes not implemented in this version")
-    # 这里可以添加原有的legacy模式代码
-
 def main():
-    port = "COM3"
+    import argparse
     
-    print("File Encryption/Decryption System")
-    print("1. Encrypt input.txt -> ciphertext.txt (New Stream Mode)")
-    print("2. Decrypt ciphertext.txt -> output.txt (New Stream Mode)")
-    print("3. Compare two files")
-    print("4. NIST Standard Test: CBC-AES128 Encrypt")
-    print("5. NIST Standard Test: CBC-AES128 Decrypt")
-    print("6. Auto Continuous: Encrypt -> Decrypt -> Compare (no reset)")
-    print("7. Legacy modes")
+    parser = argparse.ArgumentParser(description="GCM-SIV File Encryption/Decryption System (Streaming Mode Only)")
+    parser.add_argument("--port", default="COM3", help="Serial port (default: COM3)")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress display")
     
-    choice = input("Choose operation (1-7): ").strip()
+    args = parser.parse_args()
+    
+    port = args.port
+    verbose = args.verbose
+    show_progress = not args.no_progress
+    
+    print("GCM-SIV File Encryption/Decryption System (Streaming Mode Only)")
+    print("1. Encrypt file (streaming mode)")
+    print("2. Decrypt file (streaming mode)") 
+    print("3. Encrypt -> Decrypt -> Compare (streaming mode)")
+    print("4. Verify files")
+    
+    choice = input("Choose operation (1-4): ").strip()
+    
+    processor = GCM_SIV_FileProcessor(port, verbose=verbose, show_progress=show_progress)
     
     if choice == "1":
-        new_stream_file_processing_with_key_iv(port, "encrypt")
+        input_file = input("Input file [input.txt]: ").strip() or default_input
+        output_file = input("Output file [encrypted.bin]: ").strip() or default_ciphertext
+        
+        if not os.path.exists(input_file):
+            print(f"Input file does not exist: {input_file}")
+            return
+        
+        # 获取用户输入
+        key = get_user_key()
+        nonce = get_user_nonce()
+        aad = get_user_aad()
+        
+        # 流式模式加密
+        success = processor.encrypt_file(input_file, output_file, 
+                                         custom_key=key, 
+                                         custom_nonce=nonce, 
+                                         custom_aad=aad)
+        if success and os.path.exists(output_file):
+            processor.verify_encrypted_file(output_file)
+        
     elif choice == "2":
-        new_stream_file_processing_with_key_iv(port, "decrypt")
+        input_file = input("Input file [encrypted.bin]: ").strip() or default_ciphertext
+        output_file = input("Output file [decrypted.txt]: ").strip() or default_output
+        
+        if not os.path.exists(input_file):
+            print(f"Input file does not exist: {input_file}")
+            return
+        
+        # 获取用户输入
+        key = get_user_key()
+        aad = get_user_aad()
+        
+        # 流式模式解密
+        processor.decrypt_file(input_file, output_file, 
+                               custom_key=key, 
+                               custom_aad=aad)
+        
     elif choice == "3":
-        verify_files()
+        # 连续测试：加密 -> 解密 -> 验证
+        print("=== Continuous Test: Encrypt -> Decrypt -> Compare ===")
+        
+        if not os.path.exists(default_input):
+            print("Please create input.txt file first")
+            return
+            
+        # 加密（流式模式）- 使用默认值
+        print("\n--- Step 1: Encryption (使用默认值) ---")
+        encryption_success = processor.encrypt_file(default_input, default_ciphertext)
+        
+        # 检查加密结果
+        if encryption_success:
+            if os.path.exists(default_ciphertext):
+                print(f"✓ Encryption file created: {default_ciphertext}")
+                file_size = os.path.getsize(default_ciphertext)
+                print(f"  File size: {file_size} bytes")
+                
+                print("\n--- Step 2: Decryption (使用默认值) ---")
+                if processor.decrypt_file(default_ciphertext, default_output):
+                    print("\n--- Step 3: Verification ---")
+                    verify_files(default_input, default_output)
+                else:
+                    print("✗ Decryption failed")
+            else:
+                print(f"✗ Encrypted file not found: {default_ciphertext}")
+        else:
+            print("✗ Encryption failed")
+
     elif choice == "4":
-        nist_standard_test(port, "CBC-AES128-Encrypt")
-    elif choice == "5":
-        nist_standard_test(port, "CBC-AES128-Decrypt")
-    elif choice == "6":
-        auto_mode_continuous(port)
-    elif choice == "7":
-        legacy_modes(port)
+        verify_files(default_input, default_output)
+
     else:
         print("Invalid choice")
 
